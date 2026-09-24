@@ -47,7 +47,9 @@ fn test_pause_with_expiry_blocks_trading_until_expiry() {
 
     client.pause_with_expiry(&creator, &admin, &10);
 
-    let state = client.get_pause_state(&creator).expect("pause state should be set");
+    let state = client
+        .get_pause_state(&creator)
+        .expect("pause state should be set");
     assert!(state.trading_paused);
     assert_eq!(state.pause_expires_at, env.ledger().sequence() + 10);
 
@@ -62,7 +64,10 @@ fn test_pause_with_expiry_blocks_trading_until_expiry() {
     env.ledger().set(ledger);
 
     let result = client.try_buy_key(&creator, &buyer, &BASE_PRICE, &None);
-    assert!(result.is_ok(), "buy should succeed after expiry: {result:?}");
+    assert!(
+        result.is_ok(),
+        "buy should succeed after expiry: {result:?}"
+    );
     assert_eq!(client.get_key_balance(&creator, &buyer), 1);
 }
 
@@ -97,9 +102,10 @@ fn test_pause_with_expiry_emits_event_with_key_and_expiry() {
     assert_eq!(payload.key_id, creator);
     assert_eq!(payload.pause_expires_at, env.ledger().sequence() + 12);
     assert!(
-        env.events().all().iter().any(|(_, topics, _)| {
-            topics == pause_expiry_set_topics(&creator).into_val(&env)
-        }),
+        env.events()
+            .all()
+            .iter()
+            .any(|(_, topics, _)| { topics == pause_expiry_set_topics(&creator).into_val(&env) }),
         "event topics should match pause_expiry_set_topics"
     );
 }
@@ -123,9 +129,15 @@ fn test_pause_state_is_cleared_and_resumes_when_expired() {
 
     let state_after = client.get_pause_state(&creator).unwrap();
     assert!(state_after.trading_paused);
-    assert!(state_after.pause_expires_at < env.ledger().sequence() || state_after.pause_expires_at == env.ledger().sequence());
+    assert!(
+        state_after.pause_expires_at < env.ledger().sequence()
+            || state_after.pause_expires_at == env.ledger().sequence()
+    );
 
     let buyer = Address::generate(&env);
     let result = client.try_buy_key(&creator, &buyer, &BASE_PRICE, &None);
-    assert!(result.is_ok(), "buy should resume when ledger reaches expiry");
+    assert!(
+        result.is_ok(),
+        "buy should resume when ledger reaches expiry"
+    );
 }

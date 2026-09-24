@@ -7437,7 +7437,9 @@ impl CreatorKeysContract {
 
     /// Read-only view: returns the current live pause state for a key.
     pub fn get_pause_state(env: Env, key_id: Address) -> Option<PauseState> {
-        env.storage().persistent().get(&constants::storage::pause_state(&key_id))
+        env.storage()
+            .persistent()
+            .get(&constants::storage::pause_state(&key_id))
     }
 
     /// Sets a timed pause for a key's trading via the creator's multisig admin flow.
