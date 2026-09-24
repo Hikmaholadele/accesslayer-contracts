@@ -466,6 +466,31 @@ pub fn snapshot_taken_topics(creator_id: &Address, snapshot_id: u32) -> (Symbol,
     (SNAPSHOT_TAKEN_EVENT_NAME, creator_id.clone(), snapshot_id)
 }
 
+/// Event name for protocol treasury revenue distributed to stakers.
+pub const PROTOCOL_REVENUE_DISTRIBUTED_EVENT_NAME: Symbol = symbol_short!("prot_rev");
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct ProtocolRevenueDistributedEvent {
+    pub total_distributed: i128,
+    pub staker_count: u32,
+    pub snapshot_id: u32,
+}
+
+pub const PROTOCOL_REVENUE_DISTRIBUTED_DATA_FIELDS: [&str; 3] =
+    ["total_distributed", "staker_count", "snapshot_id"];
+
+pub fn protocol_revenue_distributed_topics(
+    creator_id: &Address,
+    snapshot_id: u32,
+) -> (Symbol, Address, u32) {
+    (
+        PROTOCOL_REVENUE_DISTRIBUTED_EVENT_NAME,
+        creator_id.clone(),
+        snapshot_id,
+    )
+}
+
 /// Event name for creator key identity initialization (issue #779).
 pub const KEY_INITIALISED_EVENT_NAME: Symbol = symbol_short!("key_init");
 

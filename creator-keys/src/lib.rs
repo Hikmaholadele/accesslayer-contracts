@@ -106,8 +106,8 @@ pub enum ContractError {
     InvalidRecipient = 69,
     /// Emitted when a `batch_sell` call contains fewer than 1 or more than 5 orders.
     BatchSizeExceeded = 70,
-    /// The requested pause expiry duration is outside the allowed 1..=17280 ledger window.
-    PauseTooLong = 71,
+    /// The requested holder snapshot does not exist.
+    SnapshotNotFound = 71,
 }
 
 /// Errors raised by the staking lifecycle entrypoints
@@ -542,6 +542,18 @@ pub mod constants {
             DataKey::HolderSnapshotBalance(creator.clone(), snapshot_id, holder.clone())
         }
 
+        pub fn snapshot_staked_balance(
+            creator: &Address,
+            snapshot_id: u32,
+            holder: &Address,
+        ) -> DataKey {
+            DataKey::HolderSnapshotStakedBalance(creator.clone(), snapshot_id, holder.clone())
+        }
+
+        pub fn snapshot_holders(creator: &Address, snapshot_id: u32) -> DataKey {
+            DataKey::HolderSnapshotHolders(creator.clone(), snapshot_id)
+        }
+
         pub fn key_metadata(creator: &Address) -> DataKey {
             DataKey::KeyMetadata(creator.clone())
         }
@@ -750,6 +762,57 @@ pub struct HolderKeyCountView {
     pub holder: Address,
     pub key_count: u32,
     pub creator_exists: bool,
+}
+
+/// Aggregated read-only snapshot of all key-level fields for a registered creator.
+///
+/// Returned by [`CreatorKeysContract::get_key_stats`] in a single RPC call so server
+/// sync and admin snapshot endpoints no longer need multiple round trips.
+///
+/// # Field Stability
+///
+/// Fields are append-only. Do not reorder existing fields; the Soroban XDR encoder
+/// serialises struct fields in declaration order and downstream indexers rely on
+/// positional stability.
+///
+/// # Auction fields
+///
+/// `auction_price`, `auction_supply`, and `auction_sold` are populated only when a
+/// pre-launch auction is configured for the creator. When no auction is configured,
+/// all three fields are `0` and `has_auction` is `false`.
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct KeyStatsView {
+    /// Current bonding-curve (or auction) price for the next key purchase, in stroops.
+    pub current_price: i128,
+    /// Number of keys currently in circulation (does not include locked/unclaimed allocation).
+    pub circulating_supply: u32,
+    /// Number of distinct wallets holding at least one key.
+    pub holder_count: u32,
+    /// Whether protocol-wide trading is paused (`true` means buys/sells are blocked).
+    pub trading_paused: bool,
+    /// Hard supply ceiling configured by the creator, or `0` when uncapped.
+    pub supply_cap: u32,
+    /// Per-wallet holding cap in basis points (e.g. `1000` = 10 % of supply), or `0` when uncapped.
+    pub holder_cap_bps: u32,
+    /// Circuit-breaker price-jump threshold percentage (default `30`).
+    pub circuit_breaker_threshold_bps: u32,
+    /// Sell lockup window in seconds; `0` means no lockup is configured.
+    pub lockup_duration_seconds: u64,
+    /// Launch-penalty basis points applied to early sellers; `0` means no penalty is configured.
+    pub launch_penalty_bps: u32,
+    /// Per-wallet buy cooldown in ledgers; `0` means no cooldown is configured.
+    pub buy_cooldown_ledgers: u32,
+    /// Per-transaction maximum buy quantity; `0` means no limit is configured.
+    pub max_buy_quantity: u32,
+    /// `true` when a pre-launch auction is currently configured for this creator.
+    pub has_auction: bool,
+    /// Fixed auction price per key, in stroops. `0` when `has_auction` is `false`.
+    pub auction_price: i128,
+    /// Total keys available at the fixed auction price. `0` when `has_auction` is `false`.
+    pub auction_supply: u32,
+    /// Keys already sold through the auction. `0` when `has_auction` is `false`.
+    pub auction_sold: u32,
 }
 
 /// Stable, non-optional view of a buy or sell quote.
@@ -1069,6 +1132,10 @@ pub enum DataKey {
     HolderSnapshotMeta(Address, u32),
     /// (creator, snapshot_id, holder) -> balance at snapshot time (issue #778).
     HolderSnapshotBalance(Address, u32, Address),
+    /// (creator, snapshot_id, holder) -> staked balance at snapshot time.
+    HolderSnapshotStakedBalance(Address, u32, Address),
+    /// (creator, snapshot_id) -> holder list captured by the snapshot.
+    HolderSnapshotHolders(Address, u32),
     /// (creator) -> on-chain identity metadata set via `initialise_key` (issue #779).
     KeyMetadata(Address),
     /// (creator, holder) -> ledger of the holder's most recent buy (issue #781).
@@ -4989,10 +5056,19 @@ impl CreatorKeysContract {
         for holder in holders.iter() {
             let balance_key = constants::storage::holder_balance_key(&creator, &holder);
             let balance: u32 = env.storage().persistent().get(&balance_key).unwrap_or(0);
+            let staked_key = constants::storage::staked_balance(&creator, &holder);
+            let staked_balance: u32 = env.storage().persistent().get(&staked_key).unwrap_or(0);
 
             let snap_key = constants::storage::snapshot_balance(&creator, snapshot_id, &holder);
             env.storage().persistent().set(&snap_key, &balance);
             extend_key_ttl_to_full_window(&env, &snap_key);
+
+            let snap_staked_key =
+                constants::storage::snapshot_staked_balance(&creator, snapshot_id, &holder);
+            env.storage()
+                .persistent()
+                .set(&snap_staked_key, &staked_balance);
+            extend_key_ttl_to_full_window(&env, &snap_staked_key);
 
             total_holders = total_holders
                 .checked_add(1)
@@ -5006,6 +5082,10 @@ impl CreatorKeysContract {
         env.storage().persistent().set(&meta_key, &meta);
         extend_key_ttl_to_full_window(&env, &meta_key);
 
+        let holders_key = constants::storage::snapshot_holders(&creator, snapshot_id);
+        env.storage().persistent().set(&holders_key, &holders);
+        extend_key_ttl_to_full_window(&env, &holders_key);
+
         env.events().publish(
             events::snapshot_taken_topics(&creator, snapshot_id),
             events::SnapshotTakenEvent {
@@ -5013,6 +5093,102 @@ impl CreatorKeysContract {
                 snapshot_id,
                 snapshot_ledger,
                 total_holders,
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Distributes the treasury balance pro-rata to the staked balances captured
+    /// by a holder snapshot. Payouts are added to each holder's claimable
+    /// dividend balance; floor-division dust remains in the treasury.
+    pub fn distribute_protocol_revenue(
+        env: Env,
+        admin: Address,
+        creator: Address,
+        snapshot_id: u32,
+    ) -> Result<(), ContractError> {
+        admin.require_auth();
+        assert_is_admin(&env, &admin)?;
+
+        let meta_key = constants::storage::snapshot_meta(&creator, snapshot_id);
+        let _meta: HolderSnapshotMeta = env
+            .storage()
+            .persistent()
+            .get(&meta_key)
+            .ok_or(ContractError::SnapshotNotFound)?;
+        let holders_key = constants::storage::snapshot_holders(&creator, snapshot_id);
+        let holders: soroban_sdk::Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&holders_key)
+            .ok_or(ContractError::SnapshotNotFound)?;
+        let current_price: i128 = env
+            .storage()
+            .persistent()
+            .get(&constants::storage::KEY_PRICE)
+            .ok_or(ContractError::KeyPriceNotSet)?;
+        let treasury_balance = read_treasury_balance(&env);
+
+        let mut total_weight: i128 = 0;
+        let mut weights = soroban_sdk::Vec::new(&env);
+        let mut staker_count: u32 = 0;
+        for holder in holders.iter() {
+            let staked_key =
+                constants::storage::snapshot_staked_balance(&creator, snapshot_id, &holder);
+            let staked_quantity: u32 = env.storage().persistent().get(&staked_key).unwrap_or(0);
+            let weight = i128::from(staked_quantity)
+                .checked_mul(current_price)
+                .ok_or(ContractError::Overflow)?;
+            if weight > 0 {
+                total_weight = total_weight
+                    .checked_add(weight)
+                    .ok_or(ContractError::Overflow)?;
+                staker_count = staker_count.checked_add(1).ok_or(ContractError::Overflow)?;
+            }
+            weights.push_back((holder, weight));
+        }
+
+        let mut total_distributed: i128 = 0;
+        if total_weight > 0 && treasury_balance > 0 {
+            for (holder, weight) in weights.iter() {
+                if weight == 0 {
+                    continue;
+                }
+                let payout = treasury_balance
+                    .checked_mul(weight)
+                    .ok_or(ContractError::Overflow)?
+                    / total_weight;
+                if payout == 0 {
+                    continue;
+                }
+                let pending_key = constants::storage::holder_dividend_pending(&creator, &holder);
+                let pending: i128 = env.storage().persistent().get(&pending_key).unwrap_or(0);
+                let updated_pending = pending.checked_add(payout).ok_or(ContractError::Overflow)?;
+                env.storage()
+                    .persistent()
+                    .set(&pending_key, &updated_pending);
+                extend_key_ttl_to_full_window(&env, &pending_key);
+                total_distributed = total_distributed
+                    .checked_add(payout)
+                    .ok_or(ContractError::Overflow)?;
+            }
+        }
+
+        let remaining = treasury_balance
+            .checked_sub(total_distributed)
+            .ok_or(ContractError::Overflow)?;
+        env.storage()
+            .persistent()
+            .set(&constants::storage::TREASURY_BALANCE, &remaining);
+        extend_key_ttl_to_full_window(&env, &constants::storage::TREASURY_BALANCE);
+
+        env.events().publish(
+            events::protocol_revenue_distributed_topics(&creator, snapshot_id),
+            events::ProtocolRevenueDistributedEvent {
+                total_distributed,
+                staker_count,
+                snapshot_id,
             },
         );
 
@@ -9384,6 +9560,188 @@ impl CreatorKeysContract {
     /// allowlist.
     pub fn is_approved_caller(env: Env, caller: Address) -> bool {
         is_caller_approved(&env, &caller)
+    }
+
+    /// Read-only aggregate view: returns all key-level stats for a registered creator
+    /// in a single call, reducing the number of RPC round trips needed by server sync
+    /// and admin snapshot endpoints.
+    ///
+    /// # Behaviour
+    ///
+    /// - Bumps the TTL of every persistent entry it reads so active creator state
+    ///   never expires while it is being queried.
+    /// - Never panics regardless of which optional fields are unset.
+    /// - Returns `Err(ContractError::NotRegistered)` for unknown `key_id` values
+    ///   (the 404-equivalent for view callers).
+    ///
+    /// # Auction fields
+    ///
+    /// `auction_price`, `auction_supply`, and `auction_sold` are non-zero only when a
+    /// pre-launch auction is active. `has_auction` signals to callers whether to
+    /// surface those fields.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContractError::NotRegistered`] if `key_id` has not been registered.
+    pub fn get_key_stats(env: Env, key_id: Address) -> Result<KeyStatsView, ContractError> {
+        // Require registration — this is the KeyNotFound guard.
+        let profile = read_registered_creator_profile(&env, &key_id)?;
+
+        // ── Creator profile key ────────────────────────────────────────────
+        let creator_key = constants::storage::creator(&key_id);
+        bump_persistent_ttl(&env, &creator_key);
+
+        // ── Current bonding-curve price ────────────────────────────────────
+        // Read the global base price; fall back to 0 when unset so we never panic.
+        let base_price: i128 = env
+            .storage()
+            .persistent()
+            .get(&constants::storage::KEY_PRICE)
+            .unwrap_or(0);
+        bump_persistent_ttl(&env, &constants::storage::KEY_PRICE);
+
+        let current_price = if base_price > 0 {
+            // Try auction price first; only fall through to curve when not in auction.
+            let auction_cfg: Option<AuctionConfig> = env
+                .storage()
+                .persistent()
+                .get(&constants::storage::auction_config(&key_id));
+            if let Some(ref cfg) = auction_cfg {
+                if profile.supply < cfg.auction_supply {
+                    cfg.auction_price
+                } else {
+                    compute_bonding_curve_price(&env, &key_id, base_price, profile.supply)
+                        .unwrap_or(base_price)
+                }
+            } else {
+                compute_bonding_curve_price(&env, &key_id, base_price, profile.supply)
+                    .unwrap_or(base_price)
+            }
+        } else {
+            0
+        };
+
+        // ── Supply cap ─────────────────────────────────────────────────────
+        let supply_cap_key = constants::storage::max_supply(&key_id);
+        let supply_cap: u32 = env.storage().persistent().get(&supply_cap_key).unwrap_or(0);
+        if supply_cap > 0 {
+            bump_persistent_ttl(&env, &supply_cap_key);
+        }
+
+        // ── Holder cap bps ─────────────────────────────────────────────────
+        let holder_cap_key = constants::storage::holder_cap_bps(&key_id);
+        let holder_cap_bps: u32 = env.storage().persistent().get(&holder_cap_key).unwrap_or(0);
+        if holder_cap_bps > 0 {
+            bump_persistent_ttl(&env, &holder_cap_key);
+        }
+
+        // ── Circuit-breaker threshold ──────────────────────────────────────
+        // Default is 30 when the key has never been written to storage.
+        // Only bump TTL when the entry actually exists to avoid a MissingValue panic.
+        let circuit_breaker_threshold_bps: u32 = env
+            .storage()
+            .persistent()
+            .get(&constants::storage::CIRCUIT_BREAKER_THRESHOLD)
+            .unwrap_or(30);
+        if env
+            .storage()
+            .persistent()
+            .has(&constants::storage::CIRCUIT_BREAKER_THRESHOLD)
+        {
+            bump_persistent_ttl(&env, &constants::storage::CIRCUIT_BREAKER_THRESHOLD);
+        }
+
+        // ── Sell lockup duration ───────────────────────────────────────────
+        let lockup_duration_seconds: u64 = env
+            .storage()
+            .persistent()
+            .get(&constants::storage::LOCKUP_DURATION_SECS)
+            .unwrap_or(0);
+        if lockup_duration_seconds > 0 {
+            bump_persistent_ttl(&env, &constants::storage::LOCKUP_DURATION_SECS);
+        }
+
+        // ── Launch penalty ─────────────────────────────────────────────────
+        let launch_penalty_key = constants::storage::launch_penalty_bps(&key_id);
+        let launch_penalty_bps: u32 = env
+            .storage()
+            .persistent()
+            .get(&launch_penalty_key)
+            .unwrap_or(0);
+        if launch_penalty_bps > 0 {
+            bump_persistent_ttl(&env, &launch_penalty_key);
+        }
+
+        // ── Buy cooldown ───────────────────────────────────────────────────
+        let buy_cooldown_key = constants::storage::buy_cooldown(&key_id);
+        let buy_cooldown_ledgers: u32 = env
+            .storage()
+            .persistent()
+            .get(&buy_cooldown_key)
+            .unwrap_or(0);
+        if buy_cooldown_ledgers > 0 {
+            bump_persistent_ttl(&env, &buy_cooldown_key);
+        }
+
+        // ── Max buy quantity ───────────────────────────────────────────────
+        let max_buy_qty_key = constants::storage::max_buy_quantity(&key_id);
+        let max_buy_quantity: u32 = env
+            .storage()
+            .persistent()
+            .get(&max_buy_qty_key)
+            .unwrap_or(0);
+        if max_buy_quantity > 0 {
+            bump_persistent_ttl(&env, &max_buy_qty_key);
+        }
+
+        // ── Auction config ─────────────────────────────────────────────────
+        let auction_key = constants::storage::auction_config(&key_id);
+        let auction_cfg: Option<AuctionConfig> = env.storage().persistent().get(&auction_key);
+        let (has_auction, auction_price, auction_supply, auction_sold) =
+            if let Some(ref cfg) = auction_cfg {
+                bump_persistent_ttl(&env, &auction_key);
+                (
+                    true,
+                    cfg.auction_price,
+                    cfg.auction_supply,
+                    cfg.auction_sold,
+                )
+            } else {
+                (false, 0, 0, 0)
+            };
+
+        // ── Trading paused (global OR per-key) ────────────────────────────
+        // Both flags default to `false` when absent; only bump TTL when the entry
+        // exists so we do not panic with MissingValue on a fresh deployment.
+        let trading_paused = is_paused(&env) || is_global_trading_paused(&env);
+        if env.storage().persistent().has(&constants::storage::PAUSED) {
+            bump_persistent_ttl(&env, &constants::storage::PAUSED);
+        }
+        if env
+            .storage()
+            .persistent()
+            .has(&constants::storage::GLOBAL_TRADING_PAUSED)
+        {
+            bump_persistent_ttl(&env, &constants::storage::GLOBAL_TRADING_PAUSED);
+        }
+
+        Ok(KeyStatsView {
+            current_price,
+            circulating_supply: profile.supply,
+            holder_count: profile.holder_count,
+            trading_paused,
+            supply_cap,
+            holder_cap_bps,
+            circuit_breaker_threshold_bps,
+            lockup_duration_seconds,
+            launch_penalty_bps,
+            buy_cooldown_ledgers,
+            max_buy_quantity,
+            has_auction,
+            auction_price,
+            auction_supply,
+            auction_sold,
+        })
     }
 }
 #[cfg(test)]
