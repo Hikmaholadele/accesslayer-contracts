@@ -122,6 +122,9 @@ pub const TRANSFER_EVENT_NAME: Symbol = symbol_short!("transfer");
 /// Event name for creator key buyback.
 pub const BUYBACK_EVENT_NAME: Symbol = symbol_short!("buyback");
 
+/// Event name for key redemption (deprecated keys).
+pub const KEYS_REDEEMED_EVENT_NAME: Symbol = symbol_short!("redeemed");
+
 /// Event name for referral fee earned.
 pub const REFERRAL_FEE_EARNED_EVENT_NAME: Symbol = symbol_short!("referral");
 
@@ -169,6 +172,10 @@ pub const SELL_EVENT_DATA_FIELDS: [&str; 5] =
 /// Stable field order for buyback event payloads.
 pub const BUYBACK_EVENT_DATA_FIELDS: [&str; 5] =
     ["creator", "amount", "price_paid", "new_supply", "ledger"];
+
+/// Stable field order for keys redeemed event payloads.
+pub const KEYS_REDEEMED_EVENT_DATA_FIELDS: [&str; 5] =
+    ["wallet", "key_id", "quantity", "payout_amount", "ledger"];
 
 const MIN_POLL_OPTIONS: u32 = 2;
 const MAX_POLL_OPTIONS: u32 = 4;
@@ -269,6 +276,29 @@ pub struct KeysBoughtBackEvent {
     pub ledger: u32,
 }
 
+/// Stable keys redeemed event payload for downstream indexers.
+///
+/// Event shape:
+/// - topics: `(KEYS_REDEEMED_EVENT_NAME, key_id, wallet)`
+/// - data: `KeysRedeemedEvent`
+///
+/// Emitted when a holder redeems their deprecated key balance for the fixed
+/// buyback price.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct KeysRedeemedEvent {
+    /// Address of the wallet redeeming the keys.
+    pub wallet: Address,
+    /// Address of the creator whose keys are being redeemed.
+    pub key_id: Address,
+    /// Number of keys being redeemed.
+    pub quantity: u32,
+    /// Total payout amount received by the wallet.
+    pub payout_amount: i128,
+    /// Ledger sequence number at the time of redemption.
+    pub ledger: u32,
+}
+
 /// Shared buy event topics tuple.
 pub fn buy_event_topics(creator: &Address, buyer: &Address) -> (Symbol, Address, Address) {
     (BUY_EVENT_NAME, creator.clone(), buyer.clone())
@@ -282,6 +312,11 @@ pub fn transfer_event_topics(creator: &Address, from: &Address) -> (Symbol, Addr
 /// Shared buyback event topics tuple.
 pub fn buyback_event_topics(creator: &Address) -> (Symbol, Address) {
     (BUYBACK_EVENT_NAME, creator.clone())
+}
+
+/// Shared keys redeemed event topics tuple.
+pub fn keys_redeemed_topics(key_id: &Address, wallet: &Address) -> (Symbol, Address, Address) {
+    (KEYS_REDEEMED_EVENT_NAME, key_id.clone(), wallet.clone())
 }
 
 /// Event name for dividend distribution.
