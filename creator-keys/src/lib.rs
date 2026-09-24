@@ -106,6 +106,8 @@ pub enum ContractError {
     InvalidRecipient = 69,
     /// Emitted when a `batch_sell` call contains fewer than 1 or more than 5 orders.
     BatchSizeExceeded = 70,
+    /// The requested pause expiry duration is outside the allowed 1..=17280 ledger window.
+    PauseTooLong = 71,
 }
 
 /// Errors raised by the staking lifecycle entrypoints
@@ -586,6 +588,10 @@ pub mod constants {
             DataKey::PauseProposal(creator.clone(), admin.clone())
         }
 
+        pub fn pause_state(creator: &Address) -> DataKey {
+            DataKey::PauseState(creator.clone())
+        }
+
         pub fn vesting_schedule(creator: &Address, beneficiary: &Address) -> DataKey {
             DataKey::VestingSchedule(creator.clone(), beneficiary.clone())
         }
@@ -1047,6 +1053,7 @@ pub enum DataKey {
     GlobalDeadlineLedger,
     MultisigAdmins(Address),
     PauseProposal(Address, Address),
+    PauseState(Address),
     VestingSchedule(Address, Address),
     VestingClaimed(Address, Address),
     TimelockProposal(u32),
@@ -1289,6 +1296,14 @@ pub struct MultisigAdmins {
 pub struct PauseProposal {
     pub proposer: Address,
     pub approved: bool,
+}
+
+/// Live pause state for a key's trading.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct PauseState {
+    pub trading_paused: bool,
+    pub pause_expires_at: u32,
 }
 
 /// Single discount tier definition.
@@ -1836,6 +1851,31 @@ fn is_global_trading_paused(env: &Env) -> bool {
 /// the per-key pause guard so a global halt always takes precedence.
 fn assert_global_trading_not_halted(env: &Env) -> Result<(), ContractError> {
     if is_global_trading_paused(env) {
+        return Err(ContractError::GlobalTradingHalted);
+    }
+    Ok(())
+}
+
+/// Read-only helper for the per-key pause state. A key is considered active only
+/// while `trading_paused` is `true` and the current ledger is still before the
+/// configured expiry.
+fn read_pause_state(env: &Env, key_id: &Address) -> PauseState {
+    env.storage()
+        .persistent()
+        .get(&constants::storage::pause_state(key_id))
+        .unwrap_or(PauseState {
+            trading_paused: false,
+            pause_expires_at: 0,
+        })
+}
+
+fn is_key_trading_paused(env: &Env, key_id: &Address) -> bool {
+    let state = read_pause_state(env, key_id);
+    state.trading_paused && env.ledger().sequence() < state.pause_expires_at
+}
+
+fn assert_key_trading_not_paused(env: &Env, key_id: &Address) -> Result<(), ContractError> {
+    if is_key_trading_paused(env, key_id) {
         return Err(ContractError::GlobalTradingHalted);
     }
     Ok(())
@@ -3116,6 +3156,7 @@ impl CreatorKeysContract {
     ) -> Result<u32, ContractError> {
         buyer.require_auth();
         assert_global_trading_not_halted(&env)?;
+        assert_key_trading_not_paused(&env, &creator)?;
         assert_not_paused(&env)?;
         assert_not_blacklisted(&env, &buyer)?;
         assert_before_global_deadline(&env)?;
@@ -3490,6 +3531,7 @@ impl CreatorKeysContract {
     ) -> Result<u32, ContractError> {
         buyer.require_auth();
         assert_global_trading_not_halted(&env)?;
+        assert_key_trading_not_paused(&env, &creator)?;
         assert_not_paused(&env)?;
         assert_not_blacklisted(&env, &buyer)?;
         assert_before_global_deadline(&env)?;
@@ -3862,6 +3904,7 @@ impl CreatorKeysContract {
     ) -> Result<u32, ContractError> {
         seller.require_auth();
         assert_global_trading_not_halted(&env)?;
+        assert_key_trading_not_paused(&env, &creator)?;
         assert_not_paused(&env)?;
         assert_not_blacklisted(&env, &seller)?;
 
@@ -7392,6 +7435,57 @@ impl CreatorKeysContract {
             .get(&constants::storage::multisig_admins(&creator))
     }
 
+    /// Read-only view: returns the current live pause state for a key.
+    pub fn get_pause_state(env: Env, key_id: Address) -> Option<PauseState> {
+        env.storage().persistent().get(&constants::storage::pause_state(&key_id))
+    }
+
+    /// Sets a timed pause for a key's trading via the creator's multisig admin flow.
+    ///
+    /// `duration_ledgers` must be in the inclusive range `1..=17_280` or the call
+    /// panics with [`ContractError::PauseTooLong`]. Only a configured admin may call.
+    pub fn pause_with_expiry(
+        env: Env,
+        creator: Address,
+        caller: Address,
+        duration_ledgers: u32,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+
+        let config: MultisigAdmins = env
+            .storage()
+            .persistent()
+            .get(&constants::storage::multisig_admins(&creator))
+            .ok_or(ContractError::Unauthorized)?;
+
+        if !config.admins.iter().any(|admin| admin == caller) {
+            return Err(ContractError::Unauthorized);
+        }
+
+        if duration_ledgers == 0 || duration_ledgers > 17_280 {
+            return Err(ContractError::PauseTooLong);
+        }
+
+        let pause_expires_at = env.ledger().sequence().saturating_add(duration_ledgers);
+        env.storage().persistent().set(
+            &constants::storage::pause_state(&creator),
+            &PauseState {
+                trading_paused: true,
+                pause_expires_at,
+            },
+        );
+
+        env.events().publish(
+            events::pause_expiry_set_topics(&creator),
+            events::PauseExpirySetEvent {
+                key_id: creator,
+                pause_expires_at,
+            },
+        );
+
+        Ok(())
+    }
+
     /// Proposes a pause for a creator's trading.
     ///
     /// Callable by any admin in the multisig list. If this is the first
@@ -7484,10 +7578,17 @@ impl CreatorKeysContract {
             return Err(ContractError::ProposalNotFound);
         }
 
-        // Threshold reached — execute pause
-        env.storage()
-            .persistent()
-            .set(&constants::storage::PAUSED, &true);
+        // Threshold reached — execute pause on the key itself. The legacy
+        // protocol-wide pause flag is intentionally left untouched because this
+        // multisig flow is creator-scoped and is now expiry-aware.
+        let pause_expires_at = env.ledger().sequence().saturating_add(1);
+        env.storage().persistent().set(
+            &constants::storage::pause_state(&creator),
+            &PauseState {
+                trading_paused: true,
+                pause_expires_at,
+            },
+        );
 
         // Reset all proposals
         for admin in config.admins.iter() {
