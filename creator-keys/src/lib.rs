@@ -108,6 +108,8 @@ pub enum ContractError {
     BatchSizeExceeded = 70,
     /// The requested holder snapshot does not exist.
     SnapshotNotFound = 71,
+    /// `redeem` was called on a key that has not been deprecated by its creator.
+    KeyNotDeprecated = 72,
 }
 
 /// Errors raised by the staking lifecycle entrypoints
@@ -4302,10 +4304,8 @@ impl CreatorKeysContract {
     /// # Errors
     ///
     /// - [`ContractError::NotRegistered`] if the creator is not registered.
-    /// - [`ContractError::KeyDeprecated`] is **not** returned here — it is the
-    ///   *required* condition. The function returns [`ContractError::NotRegistered`]
-    ///   when the key has not been deprecated (reusing `NotRegistered` to mean
-    ///   "the deprecation record does not exist").
+    /// - [`ContractError::KeyNotDeprecated`] if the creator is registered but
+    ///   has not called [`CreatorKeysContract::deprecate_key`].
     /// - [`ContractError::InsufficientBalance`] if the holder has no keys.
     /// - [`ContractError::InsufficientEscrow`] if the escrow pool is unexpectedly
     ///   short (should not happen under normal conditions).
@@ -4314,15 +4314,17 @@ impl CreatorKeysContract {
         holder.require_auth();
         assert_not_paused(&env)?;
 
+        // Resolve the profile first so an unknown creator reports NotRegistered
+        // rather than KeyNotDeprecated.
+        let mut profile = read_registered_creator_profile(&env, &creator)?;
+
         // The key must be deprecated before holders can redeem.
         let dep_key = constants::storage::deprecated_key(&creator);
         let buyback_price_per_key: i128 = env
             .storage()
             .persistent()
             .get(&dep_key)
-            .ok_or(ContractError::NotRegistered)?;
-
-        let mut profile = read_registered_creator_profile(&env, &creator)?;
+            .ok_or(ContractError::KeyNotDeprecated)?;
 
         let balance_key = constants::storage::holder_balance_key(&creator, &holder);
         let holder_balance: u32 = env.storage().persistent().get(&balance_key).unwrap_or(0);
