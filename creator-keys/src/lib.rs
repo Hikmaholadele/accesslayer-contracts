@@ -760,6 +760,57 @@ pub struct HolderKeyCountView {
     pub creator_exists: bool,
 }
 
+/// Aggregated read-only snapshot of all key-level fields for a registered creator.
+///
+/// Returned by [`CreatorKeysContract::get_key_stats`] in a single RPC call so server
+/// sync and admin snapshot endpoints no longer need multiple round trips.
+///
+/// # Field Stability
+///
+/// Fields are append-only. Do not reorder existing fields; the Soroban XDR encoder
+/// serialises struct fields in declaration order and downstream indexers rely on
+/// positional stability.
+///
+/// # Auction fields
+///
+/// `auction_price`, `auction_supply`, and `auction_sold` are populated only when a
+/// pre-launch auction is configured for the creator. When no auction is configured,
+/// all three fields are `0` and `has_auction` is `false`.
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct KeyStatsView {
+    /// Current bonding-curve (or auction) price for the next key purchase, in stroops.
+    pub current_price: i128,
+    /// Number of keys currently in circulation (does not include locked/unclaimed allocation).
+    pub circulating_supply: u32,
+    /// Number of distinct wallets holding at least one key.
+    pub holder_count: u32,
+    /// Whether protocol-wide trading is paused (`true` means buys/sells are blocked).
+    pub trading_paused: bool,
+    /// Hard supply ceiling configured by the creator, or `0` when uncapped.
+    pub supply_cap: u32,
+    /// Per-wallet holding cap in basis points (e.g. `1000` = 10 % of supply), or `0` when uncapped.
+    pub holder_cap_bps: u32,
+    /// Circuit-breaker price-jump threshold percentage (default `30`).
+    pub circuit_breaker_threshold_bps: u32,
+    /// Sell lockup window in seconds; `0` means no lockup is configured.
+    pub lockup_duration_seconds: u64,
+    /// Launch-penalty basis points applied to early sellers; `0` means no penalty is configured.
+    pub launch_penalty_bps: u32,
+    /// Per-wallet buy cooldown in ledgers; `0` means no cooldown is configured.
+    pub buy_cooldown_ledgers: u32,
+    /// Per-transaction maximum buy quantity; `0` means no limit is configured.
+    pub max_buy_quantity: u32,
+    /// `true` when a pre-launch auction is currently configured for this creator.
+    pub has_auction: bool,
+    /// Fixed auction price per key, in stroops. `0` when `has_auction` is `false`.
+    pub auction_price: i128,
+    /// Total keys available at the fixed auction price. `0` when `has_auction` is `false`.
+    pub auction_supply: u32,
+    /// Keys already sold through the auction. `0` when `has_auction` is `false`.
+    pub auction_sold: u32,
+}
+
 /// Stable, non-optional view of a buy or sell quote.
 ///
 /// Returned by [`CreatorKeysContract::get_buy_quote`] and [`CreatorKeysContract::get_sell_quote`].
@@ -9408,6 +9459,188 @@ impl CreatorKeysContract {
     /// allowlist.
     pub fn is_approved_caller(env: Env, caller: Address) -> bool {
         is_caller_approved(&env, &caller)
+    }
+
+    /// Read-only aggregate view: returns all key-level stats for a registered creator
+    /// in a single call, reducing the number of RPC round trips needed by server sync
+    /// and admin snapshot endpoints.
+    ///
+    /// # Behaviour
+    ///
+    /// - Bumps the TTL of every persistent entry it reads so active creator state
+    ///   never expires while it is being queried.
+    /// - Never panics regardless of which optional fields are unset.
+    /// - Returns `Err(ContractError::NotRegistered)` for unknown `key_id` values
+    ///   (the 404-equivalent for view callers).
+    ///
+    /// # Auction fields
+    ///
+    /// `auction_price`, `auction_supply`, and `auction_sold` are non-zero only when a
+    /// pre-launch auction is active. `has_auction` signals to callers whether to
+    /// surface those fields.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContractError::NotRegistered`] if `key_id` has not been registered.
+    pub fn get_key_stats(env: Env, key_id: Address) -> Result<KeyStatsView, ContractError> {
+        // Require registration — this is the KeyNotFound guard.
+        let profile = read_registered_creator_profile(&env, &key_id)?;
+
+        // ── Creator profile key ────────────────────────────────────────────
+        let creator_key = constants::storage::creator(&key_id);
+        bump_persistent_ttl(&env, &creator_key);
+
+        // ── Current bonding-curve price ────────────────────────────────────
+        // Read the global base price; fall back to 0 when unset so we never panic.
+        let base_price: i128 = env
+            .storage()
+            .persistent()
+            .get(&constants::storage::KEY_PRICE)
+            .unwrap_or(0);
+        bump_persistent_ttl(&env, &constants::storage::KEY_PRICE);
+
+        let current_price = if base_price > 0 {
+            // Try auction price first; only fall through to curve when not in auction.
+            let auction_cfg: Option<AuctionConfig> = env
+                .storage()
+                .persistent()
+                .get(&constants::storage::auction_config(&key_id));
+            if let Some(ref cfg) = auction_cfg {
+                if profile.supply < cfg.auction_supply {
+                    cfg.auction_price
+                } else {
+                    compute_bonding_curve_price(&env, &key_id, base_price, profile.supply)
+                        .unwrap_or(base_price)
+                }
+            } else {
+                compute_bonding_curve_price(&env, &key_id, base_price, profile.supply)
+                    .unwrap_or(base_price)
+            }
+        } else {
+            0
+        };
+
+        // ── Supply cap ─────────────────────────────────────────────────────
+        let supply_cap_key = constants::storage::max_supply(&key_id);
+        let supply_cap: u32 = env.storage().persistent().get(&supply_cap_key).unwrap_or(0);
+        if supply_cap > 0 {
+            bump_persistent_ttl(&env, &supply_cap_key);
+        }
+
+        // ── Holder cap bps ─────────────────────────────────────────────────
+        let holder_cap_key = constants::storage::holder_cap_bps(&key_id);
+        let holder_cap_bps: u32 = env.storage().persistent().get(&holder_cap_key).unwrap_or(0);
+        if holder_cap_bps > 0 {
+            bump_persistent_ttl(&env, &holder_cap_key);
+        }
+
+        // ── Circuit-breaker threshold ──────────────────────────────────────
+        // Default is 30 when the key has never been written to storage.
+        // Only bump TTL when the entry actually exists to avoid a MissingValue panic.
+        let circuit_breaker_threshold_bps: u32 = env
+            .storage()
+            .persistent()
+            .get(&constants::storage::CIRCUIT_BREAKER_THRESHOLD)
+            .unwrap_or(30);
+        if env
+            .storage()
+            .persistent()
+            .has(&constants::storage::CIRCUIT_BREAKER_THRESHOLD)
+        {
+            bump_persistent_ttl(&env, &constants::storage::CIRCUIT_BREAKER_THRESHOLD);
+        }
+
+        // ── Sell lockup duration ───────────────────────────────────────────
+        let lockup_duration_seconds: u64 = env
+            .storage()
+            .persistent()
+            .get(&constants::storage::LOCKUP_DURATION_SECS)
+            .unwrap_or(0);
+        if lockup_duration_seconds > 0 {
+            bump_persistent_ttl(&env, &constants::storage::LOCKUP_DURATION_SECS);
+        }
+
+        // ── Launch penalty ─────────────────────────────────────────────────
+        let launch_penalty_key = constants::storage::launch_penalty_bps(&key_id);
+        let launch_penalty_bps: u32 = env
+            .storage()
+            .persistent()
+            .get(&launch_penalty_key)
+            .unwrap_or(0);
+        if launch_penalty_bps > 0 {
+            bump_persistent_ttl(&env, &launch_penalty_key);
+        }
+
+        // ── Buy cooldown ───────────────────────────────────────────────────
+        let buy_cooldown_key = constants::storage::buy_cooldown(&key_id);
+        let buy_cooldown_ledgers: u32 = env
+            .storage()
+            .persistent()
+            .get(&buy_cooldown_key)
+            .unwrap_or(0);
+        if buy_cooldown_ledgers > 0 {
+            bump_persistent_ttl(&env, &buy_cooldown_key);
+        }
+
+        // ── Max buy quantity ───────────────────────────────────────────────
+        let max_buy_qty_key = constants::storage::max_buy_quantity(&key_id);
+        let max_buy_quantity: u32 = env
+            .storage()
+            .persistent()
+            .get(&max_buy_qty_key)
+            .unwrap_or(0);
+        if max_buy_quantity > 0 {
+            bump_persistent_ttl(&env, &max_buy_qty_key);
+        }
+
+        // ── Auction config ─────────────────────────────────────────────────
+        let auction_key = constants::storage::auction_config(&key_id);
+        let auction_cfg: Option<AuctionConfig> = env.storage().persistent().get(&auction_key);
+        let (has_auction, auction_price, auction_supply, auction_sold) =
+            if let Some(ref cfg) = auction_cfg {
+                bump_persistent_ttl(&env, &auction_key);
+                (
+                    true,
+                    cfg.auction_price,
+                    cfg.auction_supply,
+                    cfg.auction_sold,
+                )
+            } else {
+                (false, 0, 0, 0)
+            };
+
+        // ── Trading paused (global OR per-key) ────────────────────────────
+        // Both flags default to `false` when absent; only bump TTL when the entry
+        // exists so we do not panic with MissingValue on a fresh deployment.
+        let trading_paused = is_paused(&env) || is_global_trading_paused(&env);
+        if env.storage().persistent().has(&constants::storage::PAUSED) {
+            bump_persistent_ttl(&env, &constants::storage::PAUSED);
+        }
+        if env
+            .storage()
+            .persistent()
+            .has(&constants::storage::GLOBAL_TRADING_PAUSED)
+        {
+            bump_persistent_ttl(&env, &constants::storage::GLOBAL_TRADING_PAUSED);
+        }
+
+        Ok(KeyStatsView {
+            current_price,
+            circulating_supply: profile.supply,
+            holder_count: profile.holder_count,
+            trading_paused,
+            supply_cap,
+            holder_cap_bps,
+            circuit_breaker_threshold_bps,
+            lockup_duration_seconds,
+            launch_penalty_bps,
+            buy_cooldown_ledgers,
+            max_buy_quantity,
+            has_auction,
+            auction_price,
+            auction_supply,
+            auction_sold,
+        })
     }
 }
 #[cfg(test)]
