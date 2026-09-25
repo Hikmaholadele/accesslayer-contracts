@@ -39,7 +39,10 @@ fn delegation_lifecycle() {
     assert_eq!(client.get_delegate(&creator, &delegator), None);
 
     client.delegate(&creator, &delegator, &delegate);
-    assert_eq!(client.get_delegate(&creator, &delegator), Some(delegate.clone()));
+    assert_eq!(
+        client.get_delegate(&creator, &delegator),
+        Some(delegate.clone())
+    );
 
     client.revoke_delegate(&creator, &delegator);
     assert_eq!(client.get_delegate(&creator, &delegator), None);
@@ -76,7 +79,7 @@ fn delegated_voting_works() {
     client.buy_key(&creator, &delegator1, &100, &None);
     client.buy_key(&creator, &delegator1, &100, &None); // 2 keys
     client.buy_key(&creator, &delegator2, &100, &None); // 1 key
-    client.buy_key(&creator, &delegate, &100, &None);   // 1 key
+    client.buy_key(&creator, &delegate, &100, &None); // 1 key
 
     client.delegate(&creator, &delegator1, &delegate);
     client.delegate(&creator, &delegator2, &delegate);

@@ -9471,12 +9471,7 @@ impl CreatorKeysContract {
     // =========================================================================
 
     /// Assigns voting power to a delegate wallet.
-    pub fn delegate(
-        env: Env,
-        creator_id: Address,
-        delegator: Address,
-        delegate: Address,
-    ) {
+    pub fn delegate(env: Env, creator_id: Address, delegator: Address, delegate: Address) {
         delegator.require_auth();
         let delegate_key = constants::storage::delegate(&creator_id, &delegator);
         env.storage().persistent().set(&delegate_key, &delegate);
@@ -9493,11 +9488,7 @@ impl CreatorKeysContract {
     }
 
     /// Revokes a previous delegation.
-    pub fn revoke_delegate(
-        env: Env,
-        creator_id: Address,
-        delegator: Address,
-    ) {
+    pub fn revoke_delegate(env: Env, creator_id: Address, delegator: Address) {
         delegator.require_auth();
         let delegate_key = constants::storage::delegate(&creator_id, &delegator);
         env.storage().persistent().remove(&delegate_key);
@@ -9512,11 +9503,7 @@ impl CreatorKeysContract {
     }
 
     /// Read-only view: returns the current delegate for a wallet.
-    pub fn get_delegate(
-        env: Env,
-        creator_id: Address,
-        delegator: Address,
-    ) -> Option<Address> {
+    pub fn get_delegate(env: Env, creator_id: Address, delegator: Address) -> Option<Address> {
         env.storage()
             .persistent()
             .get(&constants::storage::delegate(&creator_id, &delegator))

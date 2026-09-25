@@ -397,10 +397,7 @@ pub struct DelegationRevokedEvent {
     pub delegator: Address,
 }
 
-pub fn delegation_set_topics(
-    creator: &Address,
-    delegator: &Address,
-) -> (Symbol, Address, Address) {
+pub fn delegation_set_topics(creator: &Address, delegator: &Address) -> (Symbol, Address, Address) {
     (
         DELEGATION_SET_EVENT_NAME,
         creator.clone(),
