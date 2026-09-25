@@ -2,7 +2,7 @@
 #![allow(clippy::enum_variant_names)] // `contracttype` macro-generated enums share prefixes by design
 pub mod quote_view_errors;
 
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, String, Vec, BytesN};
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, String, Vec};
 
 pub mod events;
 pub mod test_new_features;
@@ -73,7 +73,7 @@ pub enum ContractError {
     AlreadyApproved = 44,
     ProposalNotFound = 45,
     VestingNotFound = 46,
-NotWhitelisted = 49,
+    NotWhitelisted = 49,
     CircuitBreakerTriggered = 50,
     MaxHoldingExceeded = 51,
     LockupPeriodActive = 52,
@@ -108,8 +108,6 @@ NotWhitelisted = 49,
     BatchSizeExceeded = 70,
     /// The requested holder snapshot does not exist.
     SnapshotNotFound = 71,
-    /// The key is not in deprecated state; operation requires deprecation first.
-    KeyNotDeprecated = 72,
 }
 
 /// Errors raised by the staking lifecycle entrypoints
@@ -180,13 +178,6 @@ pub enum CooldownError {
     CooldownTooLong = 2,
     /// The creator address is not registered.
     NotRegistered = 3,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[contracttype]
-pub enum KeyStatus {
-    Active = 0,
-    Deprecated = 1,
 }
 
 pub mod fee {
@@ -1390,7 +1381,6 @@ pub struct CreatorProfile {
     pub supply: u32,
     pub holder_count: u32,
     pub fee_recipient: Address,
-    pub key_status: KeyStatus,
     /// Ledger sequence number captured at registration time via `env.ledger().sequence()`.
     ///
     /// Stored as the last field so existing serialised profiles written before this
@@ -3056,7 +3046,6 @@ impl CreatorKeysContract {
             supply,
             holder_count: 0,
             fee_recipient: creator.clone(),
-            key_status: KeyStatus::Active,
             registered_at: current_ledger,
         };
 
@@ -8077,150 +8066,6 @@ impl CreatorKeysContract {
         extend_creator_ttl(&env, &key_id);
 
         Ok(new_supply)
-    }
-
-    /// Deprecates a creator's key, preventing new purchases and enabling
-    /// holders to redeem their balance at the fixed buyback price.
-    ///
-    /// Only the creator can deprecate their own key. Once deprecated, the key
-    /// status changes to `Deprecated`, and holders can call `redeem` to
-    /// exchange their keys for the fixed buyback price.
-    pub fn deprecate_key(
-        env: Env,
-        creator: Address,
-    ) -> Result<(), ContractError> {
-        creator.require_auth();
-        assert_not_paused(&env)?;
-
-        let mut profile = read_registered_creator_profile(&env, &creator)?;
-        if profile.creator != creator {
-            return Err(ContractError::Unauthorized);
-        }
-
-        if profile.key_status == KeyStatus::Deprecated {
-            return Ok(());
-        }
-
-        profile.key_status = KeyStatus::Deprecated;
-
-        let key = constants::storage::creator(&creator);
-        env.storage().persistent().set(&key, &profile);
-        extend_creator_ttl(&env, &creator);
-
-        Ok(())
-    }
-
-    /// Allows a holder to redeem their deprecated key balance for the fixed
-    /// buyback price.
-    ///
-    /// The key must be in `Deprecated` status. The caller's balance is read,
-    /// and the payout is calculated as `holder_balance * buyback_price_per_key`.
-    /// The payout is transferred from the protocol treasury (which accumulates
-    /// protocol fees from trades) to the caller. After successful transfer,
-    /// the caller's balance is set to zero and the circulating supply is
-    /// decremented by the redeemed quantity.
-    ///
-    /// Emits a `keys_redeemed` event with `wallet`, `key_id`, `quantity`, and `payout_amount`.
-    pub fn redeem(
-        env: Env,
-        caller: Address,
-        key_id: Address,
-    ) -> Result<i128, ContractError> {
-        caller.require_auth();
-        assert_not_paused(&env)?;
-        assert_not_blacklisted(&env, &caller)?;
-        assert_global_trading_not_halted(&env)?;
-
-        let mut profile = read_registered_creator_profile(&env, &key_id)?;
-
-        if profile.key_status != KeyStatus::Deprecated {
-            return Err(ContractError::KeyNotDeprecated);
-        }
-
-        let balance_key = constants::storage::holder_balance_key(&key_id, &caller);
-        let current_balance: u32 = env.storage().persistent().get(&balance_key).unwrap_or(0);
-
-        if current_balance == 0 {
-            return Ok(0);
-        }
-
-        // Get the buyback price per key from the base key price
-        let base_price: i128 = env
-            .storage()
-            .persistent()
-            .get(&constants::storage::KEY_PRICE)
-            .ok_or(ContractError::KeyPriceNotSet)?;
-
-        // Calculate payout = holder_balance * buyback_price_per_key
-        // Using the base price as the fixed buyback price per key
-        let payout = (current_balance as i128)
-            .checked_mul(base_price)
-            .ok_or(ContractError::Overflow)?;
-
-        // Transfer payout from treasury to caller
-        // The treasury accumulates protocol fees from all trades
-        let treasury_balance = read_treasury_balance(&env);
-        if treasury_balance < payout {
-            return Err(ContractError::InsufficientTreasuryBalance);
-        }
-
-        // Decrement treasury balance
-        let new_treasury_balance = treasury_balance
-            .checked_sub(payout)
-            .ok_or(ContractError::Overflow)?;
-        env.storage()
-            .persistent()
-            .set(&constants::storage::TREASURY_BALANCE, &new_treasury_balance);
-
-        // Send payout to caller using native token transfer
-        // In Soroban, we use the host's native token transfer
-        // Note: In a real implementation, this would transfer XLM or the protocol token
-        // For this contract, we assume the treasury holds the native token
-        // and we're just tracking balances internally
-        // The actual token transfer would be done via the host environment
-
-        // Settle any pending dividends before zeroing the balance
-        settle_holder_dividends(&env, &key_id, &caller, current_balance)?;
-
-        // Zero the caller's balance
-        env.storage().persistent().remove(&balance_key);
-
-        // Decrement circulating supply
-        let new_supply = profile
-            .supply
-            .checked_sub(current_balance)
-            .ok_or(ContractError::Overflow)?;
-
-        // Update holder count if this was the last of their keys
-        if current_balance > 0 {
-            profile.holder_count = profile
-                .holder_count
-                .checked_sub(1)
-                .unwrap_or(0);
-        }
-
-        profile.supply = new_supply;
-
-        // Persist updated profile
-        let profile_key = constants::storage::creator(&key_id);
-        env.storage().persistent().set(&profile_key, &profile);
-        write_creator_supply(&env, &key_id, new_supply);
-
-        // Emit keys_redeemed event
-        env.events().publish(
-            events::keys_redeemed_topics(&key_id, &caller),
-            events::KeysRedeemedEvent {
-                wallet: caller.clone(),
-                key_id: key_id.clone(),
-                quantity: current_balance,
-                payout_amount: payout,
-                ledger: env.ledger().sequence(),
-            },
-        );
-
-        extend_creator_ttl(&env, &key_id);
-
-        Ok(payout)
     }
 
     /// Read-only view: returns the vesting schedule for a beneficiary.
