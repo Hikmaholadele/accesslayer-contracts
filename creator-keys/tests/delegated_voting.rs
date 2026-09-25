@@ -1,8 +1,5 @@
 use creator_keys::{events::PollError, CreatorKeysContract, CreatorKeysContractClient};
-use soroban_sdk::{
-    testutils::Address as _,
-    vec, Address, Env, String,
-};
+use soroban_sdk::{testutils::Address as _, vec, Address, Env, String};
 
 fn poll_options(env: &Env) -> soroban_sdk::Vec<String> {
     vec![
