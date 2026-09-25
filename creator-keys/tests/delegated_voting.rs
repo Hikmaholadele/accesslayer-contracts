@@ -1,6 +1,6 @@
 use creator_keys::{events::PollError, CreatorKeysContract, CreatorKeysContractClient};
 use soroban_sdk::{
-    testutils::{Address as _, Ledger},
+    testutils::Address as _,
     vec, Address, Env, String,
 };
 
