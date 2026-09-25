@@ -1339,6 +1339,11 @@ impl CreatorKeysContract {
             return Err(PollError::InvalidOption);
         }
 
+        let delegate_key = constants::storage::delegate(&creator_id, &voter);
+        if env.storage().persistent().has(&delegate_key) {
+            return Err(PollError::Unauthorized);
+        }
+
         let balance_key = constants::storage::holder_balance_key(&creator_id, &voter);
         let weight: u32 = env.storage().persistent().get(&balance_key).unwrap_or(0);
         if weight == 0 {
