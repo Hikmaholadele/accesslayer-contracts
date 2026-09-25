@@ -89,7 +89,13 @@ fn delegated_voting_works() {
     );
 
     // delegate votes on behalf of delegators (delegator 1: 2, delegator 2: 1)
-    client.cast_delegated_vote(&creator, &delegate, &vec![&env, delegator1.clone(), delegator2.clone()], &poll_id, &0);
+    client.cast_delegated_vote(
+        &creator,
+        &delegate,
+        &vec![&env, delegator1.clone(), delegator2.clone()],
+        &poll_id,
+        &0,
+    );
     // delegate votes on behalf of themselves
     client.cast_vote(&creator, &delegate, &poll_id, &0);
 
@@ -178,7 +184,13 @@ fn cast_delegated_vote_fails_if_not_delegated() {
         &10,
     );
 
-    let res = client.try_cast_delegated_vote(&creator, &random_delegate, &vec![&env, holder.clone()], &poll_id, &0);
+    let res = client.try_cast_delegated_vote(
+        &creator,
+        &random_delegate,
+        &vec![&env, holder.clone()],
+        &poll_id,
+        &0,
+    );
     assert!(res.is_err());
     assert_eq!(res.unwrap_err().unwrap(), PollError::Unauthorized);
 }

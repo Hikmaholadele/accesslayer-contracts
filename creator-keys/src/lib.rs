@@ -9544,12 +9544,16 @@ impl CreatorKeysContract {
         }
 
         for delegator in delegators.iter() {
-            let actual_delegate: Option<Address> = env.storage().persistent().get(&constants::storage::delegate(&creator_id, &delegator));
+            let actual_delegate: Option<Address> = env
+                .storage()
+                .persistent()
+                .get(&constants::storage::delegate(&creator_id, &delegator));
             if actual_delegate != Some(delegate.clone()) {
                 return Err(PollError::Unauthorized);
             }
 
-            let snapshot_key = DataKey::VoteSnapshot(creator_id.clone(), poll_id, delegator.clone());
+            let snapshot_key =
+                DataKey::VoteSnapshot(creator_id.clone(), poll_id, delegator.clone());
             let weight: u32 = if let Some(snap) = env
                 .storage()
                 .persistent()
@@ -9612,7 +9616,12 @@ impl CreatorKeysContract {
                 },
             );
             env.events().publish(
-                (POLL_VOTE_EVENT_NAME, creator_id.clone(), poll_id, delegator.clone()),
+                (
+                    POLL_VOTE_EVENT_NAME,
+                    creator_id.clone(),
+                    poll_id,
+                    delegator.clone(),
+                ),
                 (option_index, weight),
             );
         }
