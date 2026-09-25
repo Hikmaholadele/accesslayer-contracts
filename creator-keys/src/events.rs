@@ -149,6 +149,11 @@ pub const POLL_CREATED_EVENT_NAME: Symbol = symbol_short!("poll_new");
 /// Event name for governance poll votes.
 pub const POLL_VOTE_EVENT_NAME: Symbol = symbol_short!("poll_vote");
 
+/// Event name for delegation set.
+pub const DELEGATION_SET_EVENT_NAME: Symbol = symbol_short!("dlg_set");
+
+/// Event name for delegation revoked.
+pub const DELEGATION_REVOKED_EVENT_NAME: Symbol = symbol_short!("dlg_rev");
 /// Topic index for the event name in common event topic tuples.
 pub const TOPIC_EVENT_NAME_INDEX: u32 = 0;
 
@@ -369,6 +374,49 @@ pub struct DividendClaimedEvent {
 
 pub fn dividend_distributed_topics(creator: &Address) -> (Symbol, Address) {
     (DIVIDEND_DISTRIBUTED_EVENT_NAME, creator.clone())
+}
+
+/// Event shape:
+/// - topics: `(DELEGATION_SET_EVENT_NAME, creator, delegator)`
+/// - data: `DelegationSetEvent`
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct DelegationSetEvent {
+    pub creator: Address,
+    pub delegator: Address,
+    pub delegate: Address,
+}
+
+/// Event shape:
+/// - topics: `(DELEGATION_REVOKED_EVENT_NAME, creator, delegator)`
+/// - data: `DelegationRevokedEvent`
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct DelegationRevokedEvent {
+    pub creator: Address,
+    pub delegator: Address,
+}
+
+pub fn delegation_set_topics(
+    creator: &Address,
+    delegator: &Address,
+) -> (Symbol, Address, Address) {
+    (
+        DELEGATION_SET_EVENT_NAME,
+        creator.clone(),
+        delegator.clone(),
+    )
+}
+
+pub fn delegation_revoked_topics(
+    creator: &Address,
+    delegator: &Address,
+) -> (Symbol, Address, Address) {
+    (
+        DELEGATION_REVOKED_EVENT_NAME,
+        creator.clone(),
+        delegator.clone(),
+    )
 }
 
 pub fn dividend_claimed_topics(
