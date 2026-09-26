@@ -906,7 +906,6 @@ pub mod constants {
 
         pub fn creator_volume(creator: &Address) -> DataKey {
             DataKey::CreatorVolume(creator.clone())
-
         }
     }
     fn creator_key(creator: &Address) -> DataKey {
