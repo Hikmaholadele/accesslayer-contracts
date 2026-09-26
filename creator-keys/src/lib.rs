@@ -203,6 +203,109 @@ pub enum CooldownError {
     NotRegistered = 3,
 }
 
+/// Errors raised by the reputation-scoring entrypoints
+/// ([`CreatorKeysContract::get_reputation`], [`CreatorKeysContract::apply_governance_violation`]).
+///
+/// Kept separate from [`ContractError`] because Soroban caps `#[contracterror]`
+/// enums at 50 variants and `ContractError` is already at that limit.
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum ReputationError {
+    /// Arithmetic overflow while accumulating a reputation delta.
+    Overflow = 1,
+    /// The creator address is not registered.
+    NotRegistered = 2,
+    /// The caller is not the protocol admin.
+    Unauthorized = 3,
+    /// The supplied violation penalty is not positive.
+    NotPositiveAmount = 4,
+}
+
+/// Errors raised by the allowance entrypoints
+/// ([`CreatorKeysContract::approve`], [`CreatorKeysContract::transfer_from`]).
+///
+/// Kept separate from [`ContractError`] because Soroban caps `#[contracterror]`
+/// enums at 50 variants and `ContractError` is already at that limit.
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum AllowanceError {
+    /// Arithmetic overflow while decrementing a balance or allowance.
+    Overflow = 1,
+    /// The requested transfer amount was zero.
+    ZeroAmount = 2,
+    /// The spender attempted to transfer to itself.
+    SelfTransfer = 3,
+    /// The owner's live (non-frozen) key balance is smaller than the amount.
+    InsufficientBalance = 4,
+    /// The spender's approved allowance is smaller than the amount.
+    InsufficientAllowance = 5,
+    /// The creator address is not registered.
+    NotRegistered = 6,
+    /// The contract is paused.
+    ProtocolPaused = 7,
+    /// The sender's keys are frozen and cannot be transferred.
+    FrozenPosition = 8,
+    /// The recipient would exceed the creator's per-wallet holding cap.
+    HoldingCapExceeded = 9,
+    /// The spender address was the zero address.
+    ZeroAddress = 10,
+    /// The sender is still inside the creator's post-buy cooldown window.
+    CooldownActive = 11,
+}
+
+/// Errors raised by the sell-tax entrypoints
+/// ([`CreatorKeysContract::set_sell_tax_bps`], [`CreatorKeysContract::get_sell_tax_bps`]).
+///
+/// Kept separate from [`ContractError`] because Soroban caps `#[contracterror]`
+/// enums at 50 variants and `ContractError` is already at that limit.
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum SellTaxError {
+    /// The caller is not the creator owning the key.
+    Unauthorized = 1,
+    /// The creator address is not registered.
+    NotRegistered = 2,
+    /// The requested tax exceeds the protocol ceiling (`MAX_SELL_TAX_BPS`).
+    TaxExceedsMax = 3,
+    /// Arithmetic overflow while accruing the tax into the buyback pool.
+    Overflow = 4,
+}
+
+/// Errors raised by the poll quorum-escalation entrypoints
+/// ([`CreatorKeysContract::evaluate_poll_escalation`],
+/// [`CreatorKeysContract::set_escalation_config`]).
+///
+/// Kept separate from [`ContractError`] because Soroban caps `#[contracterror]`
+/// enums at 50 variants and `ContractError` is already at that limit.
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum EscalationError {
+    /// The caller is not the protocol admin.
+    Unauthorized = 1,
+    /// The poll does not exist for the creator.
+    PollNotFound = 2,
+    /// The poll has already been closed.
+    AlreadyClosed = 3,
+    /// Arithmetic overflow while extending a deadline.
+    Overflow = 4,
+    /// The proposal is not close enough to its deadline to be evaluated.
+    TooEarlyToEscalate = 5,
+    /// Participation is not within the escalation threshold of quorum.
+    BelowEscalationThreshold = 6,
+    /// The proposal already consumed its maximum number of extensions.
+    MaxExtensionsReached = 7,
+    /// Quorum escalation is disabled because no config is set.
+    EscalationDisabled = 8,
+    /// The supplied escalation configuration is invalid.
+    InvalidEscalationConfig = 9,
+    /// The creator address is not registered.
+    NotRegistered = 10,
+}
+
 pub mod fee {
     use crate::ContractError;
 
@@ -766,6 +869,35 @@ pub mod constants {
             DataKey::HasTraded(creator.clone(), trader.clone())
         }
 
+        /// Storage key for a creator's accumulated reputation score (`i128`).
+        pub fn reputation_score(creator: &Address) -> DataKey {
+            DataKey::ReputationScore(creator.clone())
+        }
+
+        /// Storage key for a creator's reputation contribution breakdown.
+        pub fn reputation_breakdown(creator: &Address) -> DataKey {
+            DataKey::ReputationBreakdown(creator.clone())
+        }
+
+        /// Storage key for an `(owner, spender, key_id)` transfer allowance.
+        pub fn key_allowance(owner: &Address, spender: &Address, key_id: &Address) -> DataKey {
+            DataKey::KeyAllowance(owner.clone(), spender.clone(), key_id.clone())
+        }
+
+        /// Storage key for a creator's sell tax in basis points.
+        pub fn sell_tax_bps(creator: &Address) -> DataKey {
+            DataKey::SellTaxBps(creator.clone())
+        }
+
+        /// Storage key for the protocol-wide buyback pool balance (`i128`).
+        pub const BUYBACK_POOL_BALANCE: DataKey = DataKey::BuybackPoolBalance;
+
+        /// Storage key for the address credited with the buyback pool balance.
+        pub const BUYBACK_POOL_ADDRESS: DataKey = DataKey::BuybackPoolAddress;
+
+        /// Storage key for the protocol-wide poll quorum-escalation config.
+        pub const ESCALATION_CONFIG: DataKey = DataKey::EscalationConfig;
+
         pub fn creator_volume(creator: &Address) -> DataKey {
             DataKey::CreatorVolume(creator.clone())
         }
@@ -1144,6 +1276,82 @@ pub const MAX_BUY_QUANTITY_LIMIT: u32 = 10_000;
 /// auction price before the bonding curve takes over.
 pub const MAX_AUCTION_SUPPLY: u32 = 10_000;
 
+// ---------------------------------------------------------------------------
+// Reputation scoring
+// ---------------------------------------------------------------------------
+
+/// Reputation awarded for a successful key launch.
+pub const REPUTATION_KEY_LAUNCH_POINTS: i128 = 100;
+
+/// Reputation awarded for each supply milestone crossed upward.
+pub const REPUTATION_MILESTONE_POINTS: i128 = 25;
+
+/// Reputation awarded for participating in a governance vote.
+pub const REPUTATION_GOVERNANCE_PARTICIPATION_POINTS: i128 = 10;
+
+/// Reputation awarded for each completed trade on the creator's own key.
+pub const REPUTATION_TRADE_POINTS: i128 = 5;
+
+/// Reputation penalty applied when a creator deprecates their own key.
+pub const REPUTATION_DEPRECATION_PENALTY: i128 = 50;
+
+/// Lowest reputation score a creator can hold. Decrements saturate at zero
+/// rather than pushing the score negative, so the scale is a floor-bounded
+/// `i128` rather than a signed balance.
+pub const REPUTATION_MIN_SCORE: i128 = 0;
+
+/// Upper bound on the penalty a single governance violation may apply, so a
+/// misconfigured [`CreatorKeysContract::apply_governance_violation`] call cannot
+/// wipe out a creator's accumulated standing in one transaction.
+pub const MAX_GOVERNANCE_VIOLATION_PENALTY: i128 = 1_000;
+
+// ---------------------------------------------------------------------------
+// Sell tax and buyback pool
+// ---------------------------------------------------------------------------
+
+/// Maximum per-key sell tax in basis points (10%).
+///
+/// Creators configure their own sell tax via
+/// [`CreatorKeysContract::set_sell_tax_bps`] but cannot exceed this ceiling,
+/// which keeps the tax bounded relative to the creator's own payout.
+pub const MAX_SELL_TAX_BPS: u32 = 1_000;
+
+// ---------------------------------------------------------------------------
+// Governance quorum escalation
+// ---------------------------------------------------------------------------
+
+/// Default quorum-escalation threshold in basis points (50% of the required
+/// quorum). A proposal whose participation has reached this fraction of its
+/// quorum requirement inside the evaluation window is eligible for an extension.
+pub const DEFAULT_ESCALATION_THRESHOLD_BPS: u32 = 5_000;
+
+/// Default number of ledgers added per quorum-escalation extension (~12 hours
+/// at 5 s per ledger).
+pub const DEFAULT_ESCALATION_EXTENSION_LEDGERS: u32 = 8_640;
+
+/// Default maximum number of times a single proposal may be extended.
+pub const DEFAULT_MAX_ESCALATION_EXTENSIONS: u32 = 3;
+
+/// Floor on the escalation threshold (1% of quorum).
+pub const MIN_ESCALATION_THRESHOLD_BPS: u32 = 100;
+
+/// Ceiling on the escalation threshold (100% of quorum). A threshold of
+/// 10 000 means "extend only once the proposal has fully reached quorum",
+/// which effectively disables the mechanism without turning it off.
+pub const MAX_ESCALATION_THRESHOLD_BPS: u32 = 10_000;
+
+/// Upper bound on the number of extensions a single proposal may consume,
+/// preventing indefinite postponement of a vote.
+pub const MAX_ESCALATION_EXTENSIONS_BOUND: u32 = 10;
+
+/// Upper bound on a single extension duration in ledgers (~30 days at 5 s
+/// per ledger) so a configured extension cannot stall governance forever.
+pub const MAX_ESCALATION_EXTENSION_LEDGERS: u32 = 518_400;
+
+/// How many ledgers before the deadline a proposal becomes eligible for
+/// escalation evaluation.
+pub const ESCALATION_EVALUATION_WINDOW_LEDGERS: u32 = 1_080;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[contracttype]
 pub enum CurvePreset {
@@ -1350,6 +1558,20 @@ pub enum DataKey {
     UniqueTraderCount(Address),
     /// Per-creator per-wallet flag: true if this wallet has ever traded.
     HasTraded(Address, Address),
+    /// (creator) -> accumulated reputation score (`i128`, floored at zero).
+    ReputationScore(Address),
+    /// (creator) -> per-reason contribution breakdown backing the reputation score.
+    ReputationBreakdown(Address),
+    /// (owner, spender, key_id) -> approved transfer allowance in whole keys (`u32`).
+    KeyAllowance(Address, Address, Address),
+    /// (creator) -> per-key sell tax in basis points.
+    SellTaxBps(Address),
+    /// Protocol-wide buyback pool balance in stroops (`i128`).
+    BuybackPoolBalance,
+    /// Address credited with the buyback pool balance.
+    BuybackPoolAddress,
+    /// Protocol-wide poll quorum-escalation configuration.
+    EscalationConfig,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -2143,6 +2365,11 @@ fn emit_milestone_crossings(
                     supply: new_supply,
                 },
             );
+            // Only upward crossings are a positive signal; a sell that drops
+            // supply back below a tier must not earn reputation for it.
+            if up {
+                accrue_reputation_on_milestone(env, creator)?;
+            }
         }
     }
     Ok(())
@@ -2385,13 +2612,18 @@ pub fn read_protocol_fee_bps(env: &Env) -> u32 {
 /// The zero address (`GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF`)
 /// is the all-zero public key. Setting it as a fee recipient would silently
 /// burn all protocol fees. This helper rejects it at the point of assignment.
-fn validate_non_zero_address(env: &Env, addr: &Address) -> Result<(), ContractError> {
-    let zero_str = String::from_str(
+/// Returns the canonical Stellar zero address, used as the placeholder
+/// destination for funds the contract holds on behalf of an unassigned
+/// recipient.
+fn zero_address(env: &Env) -> Address {
+    Address::from_string(&String::from_str(
         env,
         "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
-    );
-    let zero_addr = Address::from_string(&zero_str);
-    if *addr == zero_addr {
+    ))
+}
+
+fn validate_non_zero_address(env: &Env, addr: &Address) -> Result<(), ContractError> {
+    if *addr == zero_address(env) {
         return Err(ContractError::ZeroAddress);
     }
     Ok(())
@@ -3007,7 +3239,7 @@ fn compute_claimable_dividend(env: &Env, creator: &Address, holder: &Address) ->
 /// `CREATOR_TTL_LEDGERS` on fresh networks; forcing the full window at write
 /// time keeps the entry's real TTL aligned with the live-until the contract
 /// tracks for the TTL-extension event.
-fn extend_key_ttl_to_full_window<K: soroban_sdk::IntoVal<Env, soroban_sdk::Val>>(
+pub fn extend_key_ttl_to_full_window<K: soroban_sdk::IntoVal<Env, soroban_sdk::Val>>(
     env: &Env,
     key: &K,
 ) {
@@ -3590,6 +3822,130 @@ pub struct AnalyticsView {
     pub total_volume: i128,
 }
 
+/// Identifies which on-chain action produced a reputation change.
+///
+/// Append-only: new variants must be added at the end so the serialized
+/// discriminant stays stable for indexers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[contracttype]
+pub enum ReputationReason {
+    /// A key was launched successfully.
+    KeyLaunch = 0,
+    /// A configured supply milestone was crossed upward.
+    Milestone = 1,
+    /// The creator participated in a governance vote.
+    GovernanceParticipation = 2,
+    /// A trade executed against the creator's key.
+    Trade = 3,
+    /// The creator deprecated their own key.
+    KeyDeprecation = 4,
+    /// A governance violation was recorded against the creator.
+    GovernanceViolation = 5,
+}
+
+/// Per-reason contribution breakdown backing a creator's reputation score.
+///
+/// Each points field accumulates the signed points contributed by that reason
+/// since registration, and each count field records how many times that reason
+/// fired. `score` is the floor-bounded sum of every points field, so the
+/// breakdown always reconciles with the headline score.
+///
+/// Fields are append-only — do not reorder.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[contracttype]
+pub struct ReputationBreakdown {
+    /// Points from successful key launches.
+    pub key_launch_points: i128,
+    /// Points from supply milestones crossed.
+    pub milestone_points: i128,
+    /// Points from governance participation.
+    pub governance_points: i128,
+    /// Points from trading activity.
+    pub trade_points: i128,
+    /// Penalty points from key deprecation (negative).
+    pub deprecation_penalty: i128,
+    /// Penalty points from governance violations (negative).
+    pub violation_penalty: i128,
+    /// Number of key launches credited.
+    pub key_launches: u32,
+    /// Number of milestones credited.
+    pub milestones_reached: u32,
+    /// Number of governance votes participated in.
+    pub governance_participations: u32,
+    /// Number of trades credited.
+    pub trades: u32,
+    /// Number of governance violations recorded.
+    pub governance_violations: u32,
+    /// Number of times the score changed.
+    pub update_count: u32,
+    /// Ledger of the most recent score change.
+    pub last_updated_ledger: u32,
+}
+
+/// Full reputation state for a creator, returned by `get_reputation`.
+///
+/// Fields are append-only — do not reorder.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct ReputationView {
+    /// Creator address.
+    pub creator: Address,
+    /// Current floor-bounded reputation score.
+    pub score: i128,
+    /// Signed per-reason contribution breakdown.
+    pub breakdown: ReputationBreakdown,
+    /// Number of key launches credited.
+    pub key_launches: u32,
+    /// Number of milestones credited.
+    pub milestones_reached: u32,
+    /// Number of governance votes participated in.
+    pub governance_participations: u32,
+    /// Number of governance violations recorded.
+    pub governance_violations: u32,
+    /// `true` when the creator's key has been deprecated.
+    pub deprecated: bool,
+}
+
+/// Protocol-wide poll quorum-escalation configuration.
+///
+/// `threshold_bps` is measured against the proposal's own quorum requirement,
+/// so a creator-configured `quorum_bps` and this value compose cleanly.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct EscalationConfig {
+    /// Fraction of the quorum requirement that must already be met to qualify
+    /// for an extension, in basis points.
+    pub threshold_bps: u32,
+    /// Ledgers added to the proposal deadline per extension.
+    pub extension_ledgers: u32,
+    /// Maximum number of extensions a single proposal may consume.
+    pub max_extensions: u32,
+}
+
+/// Read-only view of a proposal's quorum-escalation state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct EscalationView {
+    /// Proposal id, scoped to the creator.
+    pub poll_id: u32,
+    /// Current deadline ledger.
+    pub expires_at: u32,
+    /// Extensions already consumed.
+    pub extensions_used: u32,
+    /// Maximum extensions allowed by the active config.
+    pub max_extensions: u32,
+    /// Number of ledgers remaining before the deadline.
+    pub ledgers_remaining: u32,
+    /// Current participation in basis points of circulating supply.
+    pub participation_bps: u32,
+    /// Quorum requirement in basis points of circulating supply.
+    pub quorum_bps: u32,
+    /// `true` when participation has reached the escalation threshold.
+    pub eligible: bool,
+    /// `true` when no further extension is possible.
+    pub exhausted: bool,
+}
+
 /// Live market-state view for a creator's key, aggregating the individual
 /// read-only getters into a single call.
 #[derive(Clone, Debug, PartialEq)]
@@ -3673,8 +4029,248 @@ fn accrue_trade_analytics(
         env.storage().persistent().set(&vol_key, &new_vol);
     }
 
+    // Trading activity is a positive reputation signal, awarded on the same
+    // path for buys and sells so both flows feed the score identically.
+    accrue_reputation_on_trade(env, creator)?;
+
     Ok(())
 }
+
+/// Applies a signed reputation delta to a creator's score and breakdown, then
+/// emits [`events::ReputationUpdatedEvent`].
+///
+/// The score is floored at [`REPUTATION_MIN_SCORE`]: a decrement that would take
+/// it below zero saturates at zero rather than wrapping into a negative or
+/// panicking. `delta` is recorded verbatim in the event so consumers can see
+/// the applied change, while `new_score` reflects the clamped result.
+///
+/// A `delta` of `0` is a no-op and emits nothing, which keeps callers free to
+/// compute a conditional contribution without a separate guard.
+fn apply_reputation_delta(
+    env: &Env,
+    creator: &Address,
+    delta: i128,
+    reason: ReputationReason,
+) -> Result<(), ReputationError> {
+    if delta == 0 {
+        return Ok(());
+    }
+
+    let score_key = constants::storage::reputation_score(creator);
+    let old_score: i128 = env.storage().persistent().get(&score_key).unwrap_or(0);
+
+    // Floor the score at zero instead of letting decrements go negative.
+    let new_score = if delta < 0 && old_score + delta < REPUTATION_MIN_SCORE {
+        REPUTATION_MIN_SCORE
+    } else {
+        old_score
+            .checked_add(delta)
+            .ok_or(ReputationError::Overflow)?
+    };
+
+    let breakdown_key = constants::storage::reputation_breakdown(creator);
+    let mut breakdown: ReputationBreakdown = env
+        .storage()
+        .persistent()
+        .get(&breakdown_key)
+        .unwrap_or_default();
+
+    match reason {
+        ReputationReason::KeyLaunch => {
+            breakdown.key_launch_points = breakdown
+                .key_launch_points
+                .checked_add(delta)
+                .ok_or(ReputationError::Overflow)?;
+            breakdown.key_launches = breakdown
+                .key_launches
+                .checked_add(1)
+                .ok_or(ReputationError::Overflow)?;
+        }
+        ReputationReason::Milestone => {
+            breakdown.milestone_points = breakdown
+                .milestone_points
+                .checked_add(delta)
+                .ok_or(ReputationError::Overflow)?;
+            breakdown.milestones_reached = breakdown
+                .milestones_reached
+                .checked_add(1)
+                .ok_or(ReputationError::Overflow)?;
+        }
+        ReputationReason::GovernanceParticipation => {
+            breakdown.governance_points = breakdown
+                .governance_points
+                .checked_add(delta)
+                .ok_or(ReputationError::Overflow)?;
+            breakdown.governance_participations = breakdown
+                .governance_participations
+                .checked_add(1)
+                .ok_or(ReputationError::Overflow)?;
+        }
+        ReputationReason::Trade => {
+            breakdown.trade_points = breakdown
+                .trade_points
+                .checked_add(delta)
+                .ok_or(ReputationError::Overflow)?;
+            breakdown.trades = breakdown
+                .trades
+                .checked_add(1)
+                .ok_or(ReputationError::Overflow)?;
+        }
+        ReputationReason::KeyDeprecation => {
+            breakdown.deprecation_penalty = breakdown
+                .deprecation_penalty
+                .checked_add(delta)
+                .ok_or(ReputationError::Overflow)?;
+        }
+        ReputationReason::GovernanceViolation => {
+            breakdown.violation_penalty = breakdown
+                .violation_penalty
+                .checked_add(delta)
+                .ok_or(ReputationError::Overflow)?;
+            breakdown.governance_violations = breakdown
+                .governance_violations
+                .checked_add(1)
+                .ok_or(ReputationError::Overflow)?;
+        }
+    }
+
+    breakdown.update_count = breakdown
+        .update_count
+        .checked_add(1)
+        .ok_or(ReputationError::Overflow)?;
+    breakdown.last_updated_ledger = env.ledger().sequence();
+
+    env.storage().persistent().set(&score_key, &new_score);
+    extend_key_ttl_to_full_window(env, &score_key);
+    env.storage().persistent().set(&breakdown_key, &breakdown);
+    extend_key_ttl_to_full_window(env, &breakdown_key);
+
+    env.events().publish(
+        events::reputation_updated_topics(creator),
+        events::ReputationUpdatedEvent {
+            creator: creator.clone(),
+            old_score,
+            new_score,
+            delta,
+            reason,
+            ledger: breakdown.last_updated_ledger,
+        },
+    );
+
+    Ok(())
+}
+
+/// Reads a creator's stored reputation score, defaulting to zero.
+fn read_reputation_score(env: &Env, creator: &Address) -> i128 {
+    let key = constants::storage::reputation_score(creator);
+    env.storage().persistent().get(&key).unwrap_or(0)
+}
+
+/// Reads a creator's stored reputation breakdown, defaulting to all zeros.
+fn read_reputation_breakdown(env: &Env, creator: &Address) -> ReputationBreakdown {
+    let key = constants::storage::reputation_breakdown(creator);
+    env.storage().persistent().get(&key).unwrap_or_default()
+}
+
+/// Awards the positive reputation for a milestone crossed upward.
+///
+/// Called from the milestone emitter so a configured supply milestone feeds the
+/// creator's standing exactly once per crossing.
+fn accrue_reputation_on_milestone(env: &Env, creator: &Address) -> Result<(), ContractError> {
+    apply_reputation_delta(
+        env,
+        creator,
+        REPUTATION_MILESTONE_POINTS,
+        ReputationReason::Milestone,
+    )
+    .map_err(|_| ContractError::Overflow)
+}
+
+/// Awards the positive reputation for a completed trade.
+///
+/// Called from the trade-analytics accumulator so buy and sell share one path.
+fn accrue_reputation_on_trade(env: &Env, creator: &Address) -> Result<(), ContractError> {
+    apply_reputation_delta(
+        env,
+        creator,
+        REPUTATION_TRADE_POINTS,
+        ReputationReason::Trade,
+    )
+    .map_err(|_| ContractError::Overflow)
+}
+
+/// Awards the positive reputation for a governance vote cast on a creator's key.
+///
+/// Called from `cast_vote` so only votes that actually settle are credited;
+/// re-voting before expiry still counts as a fresh participation.
+pub(crate) fn accrue_reputation_on_governance_participation(
+    env: &Env,
+    creator: &Address,
+) -> Result<(), ContractError> {
+    apply_reputation_delta(
+        env,
+        creator,
+        REPUTATION_GOVERNANCE_PARTICIPATION_POINTS,
+        ReputationReason::GovernanceParticipation,
+    )
+    .map_err(|_| ContractError::Overflow)
+}
+
+/// Converts a poll's total vote weight into basis points of circulating supply.
+///
+/// Returns `0` when the creator has no circulating supply, which keeps a
+/// zero-supply poll from reporting full participation.
+fn escalation_participation_bps(
+    total_weight: u32,
+    circulating_supply: u32,
+) -> Result<u32, EscalationError> {
+    if circulating_supply == 0 {
+        return Ok(0);
+    }
+    let bps = (total_weight as u128)
+        .checked_mul(10_000)
+        .ok_or(EscalationError::Overflow)?
+        / circulating_supply as u128;
+    // Participation is clamped to 100% so a poll whose voters collectively hold
+    // more than the tracked supply cannot outrank a full-quorum threshold.
+    Ok(bps.min(10_000) as u32)
+}
+
+/// Decides whether a proposal qualifies for a quorum-escalation extension.
+///
+/// The proposal must have consumed fewer than `max_extensions` extensions, must
+/// carry a non-zero quorum requirement, must not have reached that requirement
+/// yet, and its participation must already have reached `threshold_bps` of it.
+///
+/// The two disqualifying quorum cases are deliberate:
+///
+/// - `quorum_bps == 0` means [`events::close_poll`] imposes no quorum check at
+///   all, so there is no participation shortfall for escalation to rescue.
+/// - `participation_bps >= quorum_bps` means the proposal can already close; an
+///   extension would only consume one of the creator's budgeted extensions.
+fn is_escalation_eligible(
+    participation_bps: u32,
+    quorum_bps: u32,
+    threshold_bps: u32,
+    max_extensions: u32,
+    extensions_used: u32,
+) -> bool {
+    if max_extensions == 0 || extensions_used >= max_extensions {
+        return false;
+    }
+    if quorum_bps == 0 {
+        return false;
+    }
+    if participation_bps >= quorum_bps {
+        return false;
+    }
+    // "Close to quorum": participation has reached `threshold_bps` of the
+    // proposal's own requirement. `threshold_bps` is validated to be non-zero by
+    // `set_escalation_config`, so a zero-participation poll never qualifies.
+    let required_bps = (quorum_bps as u128).saturating_mul(threshold_bps as u128) / 10_000;
+    (participation_bps as u128) >= required_bps
+}
+
 #[contract]
 pub struct CreatorKeysContract;
 
@@ -4845,7 +5441,38 @@ impl CreatorKeysContract {
         // (7 days / 120,960 ledgers of the key's creation), deduct a
         // configurable penalty from the proceeds and credit it to the
         // creator fee balance.
-        let proceeds = compute_sell_proceeds(&env, price).unwrap_or(0);
+        let gross_proceeds = compute_sell_proceeds(&env, price).unwrap_or(0);
+
+        // Sell tax: deduct the creator's configured tax from their proceeds and
+        // forward it to the buyback pool. The pool credit and the proceeds
+        // reduction happen in the same call, so a sell either does both or
+        // neither. `proceeds` below is what the seller actually receives.
+        let (proceeds, tax_amount, pool_balance_after) =
+            Self::collect_sell_tax(&env, &creator, gross_proceeds)?;
+        if tax_amount > 0 {
+            // Until an admin assigns a pool the collected tax is held against
+            // the zero address rather than a fabricated recipient, so the
+            // unassigned balance is always visible in the event.
+            let pool: Address = env
+                .storage()
+                .persistent()
+                .get(&constants::storage::BUYBACK_POOL_ADDRESS)
+                .unwrap_or_else(|| zero_address(&env));
+            env.events().publish(
+                events::sell_tax_collected_topics(&creator, &seller),
+                events::SellTaxCollectedEvent {
+                    creator: creator.clone(),
+                    seller: seller.clone(),
+                    amount: tax_amount,
+                    pool,
+                    tax_bps: Self::get_sell_tax_bps(env.clone(), creator.clone()),
+                    gross_proceeds,
+                    net_proceeds: proceeds,
+                    pool_balance: pool_balance_after,
+                    ledger: env.ledger().sequence(),
+                },
+            );
+        }
 
         if let Some(created_at) = env
             .storage()
@@ -5080,6 +5707,15 @@ impl CreatorKeysContract {
                 ledger: env.ledger().sequence(),
             },
         );
+
+        // Deprecating a key is a negative reputation signal for the creator.
+        apply_reputation_delta(
+            &env,
+            &creator,
+            -REPUTATION_DEPRECATION_PENALTY,
+            ReputationReason::KeyDeprecation,
+        )
+        .map_err(|_| ContractError::Overflow)?;
 
         Ok(())
     }
@@ -6582,11 +7218,20 @@ impl CreatorKeysContract {
             events::key_registered_topics(&creator),
             events::KeyRegisteredEvent {
                 key_id: creator.clone(),
-                creator,
+                creator: creator.clone(),
                 auction_pending: auction_mode,
                 registered_at_ledger: current_ledger,
             },
         );
+
+        // A successful key launch is a positive reputation signal.
+        apply_reputation_delta(
+            &env,
+            &creator,
+            REPUTATION_KEY_LAUNCH_POINTS,
+            ReputationReason::KeyLaunch,
+        )
+        .map_err(|_| ContractError::Overflow)?;
 
         Ok(())
     }
@@ -12414,6 +13059,699 @@ impl CreatorKeysContract {
             unique_traders,
             total_volume,
         })
+    }
+
+    // -----------------------------------------------------------------------
+    // Feature: creator reputation scoring
+    // -----------------------------------------------------------------------
+
+    /// Read-only view: returns a creator's reputation score and its per-reason
+    /// breakdown.
+    ///
+    /// The breakdown accumulates the signed points contributed by each reason
+    /// since registration, so it always reconciles with the headline `score`.
+    /// A creator with no recorded history returns a zeroed view rather than an
+    /// error, but the creator must still be registered.
+    ///
+    /// # Errors
+    /// - [`ReputationError::NotRegistered`] if the creator is not registered.
+    pub fn get_reputation(env: Env, creator: Address) -> Result<ReputationView, ReputationError> {
+        read_registered_creator_profile(&env, &creator)
+            .map_err(|_| ReputationError::NotRegistered)?;
+
+        let score = read_reputation_score(&env, &creator);
+        let breakdown = read_reputation_breakdown(&env, &creator);
+
+        let deprecated: bool = env
+            .storage()
+            .persistent()
+            .has(&constants::storage::deprecated_key(&creator));
+
+        Ok(ReputationView {
+            creator,
+            score,
+            key_launches: breakdown.key_launches,
+            milestones_reached: breakdown.milestones_reached,
+            governance_participations: breakdown.governance_participations,
+            governance_violations: breakdown.governance_violations,
+            deprecated,
+            breakdown,
+        })
+    }
+
+    /// Records a governance violation against a creator, decrementing their
+    /// reputation score.
+    ///
+    /// The protocol admin must authorize the call. `penalty` is a positive
+    /// point deduction capped at [`MAX_GOVERNANCE_VIOLATION_PENALTY`] so a
+    /// single call cannot wipe out a creator's accumulated standing. The
+    /// resulting score is floored at [`REPUTATION_MIN_SCORE`].
+    ///
+    /// # Errors
+    /// - [`ReputationError::Unauthorized`] if `admin` is not the protocol admin.
+    /// - [`ReputationError::NotRegistered`] if the creator is not registered.
+    /// - [`ReputationError::NotPositiveAmount`] if `penalty` is not positive.
+    pub fn apply_governance_violation(
+        env: Env,
+        admin: Address,
+        creator: Address,
+        penalty: i128,
+    ) -> Result<(), ReputationError> {
+        admin.require_auth();
+        assert_is_admin(&env, &admin).map_err(|_| ReputationError::Unauthorized)?;
+        read_registered_creator_profile(&env, &creator)
+            .map_err(|_| ReputationError::NotRegistered)?;
+        if penalty <= 0 {
+            return Err(ReputationError::NotPositiveAmount);
+        }
+
+        let bounded = penalty.min(MAX_GOVERNANCE_VIOLATION_PENALTY);
+        apply_reputation_delta(
+            &env,
+            &creator,
+            -bounded,
+            ReputationReason::GovernanceViolation,
+        )
+    }
+
+    // -----------------------------------------------------------------------
+    // Feature: key transfer allowances (approve / transfer_from)
+    // -----------------------------------------------------------------------
+
+    /// Read-only view: returns the remaining transfer allowance `spender` may
+    /// draw from `owner`'s balance of `key_id`.
+    ///
+    /// Returns `0` when no allowance has been granted.
+    pub fn get_allowance(env: Env, owner: Address, spender: Address, key_id: Address) -> u32 {
+        let key = constants::storage::key_allowance(&owner, &spender, &key_id);
+        env.storage().persistent().get(&key).unwrap_or(0)
+    }
+
+    /// Sets the transfer allowance `spender` may draw from the caller's
+    /// balance of `key_id`.
+    ///
+    /// The allowance is per `(owner, spender, key_id)` tuple and is overwritten
+    /// rather than accumulated, matching the ERC-20 `approve` semantics that
+    /// marketplace and staking integrations expect. Passing `amount = 0` revokes
+    /// the allowance and removes the storage entry.
+    ///
+    /// The owner must authorize the call. `spender` must not be the zero
+    /// address, and must not be the owner themselves (a self-allowance is
+    /// meaningless and would only create a second transfer path around
+    /// `transfer_keys`).
+    ///
+    /// # Errors
+    /// - [`AllowanceError::ZeroAddress`] if `spender` is the zero address.
+    /// - [`AllowanceError::SelfTransfer`] if `spender` is the caller.
+    /// - [`AllowanceError::NotRegistered`] if `key_id` is not registered.
+    pub fn approve(
+        env: Env,
+        owner: Address,
+        spender: Address,
+        key_id: Address,
+        amount: u32,
+    ) -> Result<(), AllowanceError> {
+        owner.require_auth();
+        validate_non_zero_address(&env, &spender).map_err(|_| AllowanceError::ZeroAddress)?;
+        if spender == owner {
+            return Err(AllowanceError::SelfTransfer);
+        }
+        read_registered_creator_profile(&env, &key_id)
+            .map_err(|_| AllowanceError::NotRegistered)?;
+
+        let key = constants::storage::key_allowance(&owner, &spender, &key_id);
+        if amount == 0 {
+            env.storage().persistent().remove(&key);
+        } else {
+            env.storage().persistent().set(&key, &amount);
+            extend_key_ttl_to_full_window(&env, &key);
+        }
+
+        env.events().publish(
+            events::approval_topics(&owner, &spender),
+            events::ApprovalEvent {
+                owner,
+                spender,
+                amount,
+                key_id,
+                ledger: env.ledger().sequence(),
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Transfers keys from `from` to `to` on behalf of `from`, drawing down the
+    /// allowance `from` granted to the calling `spender` via
+    /// [`CreatorKeysContract::approve`].
+    ///
+    /// The spender must authorize the call. Every invariant enforced by
+    /// `transfer_keys` is enforced here too: the protocol pause flag, the
+    /// creator's post-buy cooldown window, the frozen-position guard, the
+    /// recipient's per-wallet holding cap, and dividend settlement for both
+    /// sides. A holder-count-changed event is emitted on the same zero-boundary
+    /// crossings as the direct transfer path. Supply and holder counts are
+    /// untouched by minting or burning — ownership simply moves.
+    ///
+    /// The allowance is decremented in the same call that moves the keys, so a
+    /// spender can never spend the same allowance twice.
+    ///
+    /// # Errors
+    /// - [`AllowanceError::ProtocolPaused`] if the contract is paused.
+    /// - [`AllowanceError::ZeroAmount`] if `amount` is zero.
+    /// - [`AllowanceError::SelfTransfer`] if `from == to`.
+    /// - [`AllowanceError::ZeroAddress`] if `to` is the zero address.
+    /// - [`AllowanceError::NotRegistered`] if `key_id` is not registered.
+    /// - [`AllowanceError::CooldownActive`] if `from` is inside the creator's
+    ///   post-buy cooldown window.
+    /// - [`AllowanceError::FrozenPosition`] if `from`'s keys are frozen.
+    /// - [`AllowanceError::InsufficientBalance`] if `from`'s available balance
+    ///   is below `amount`.
+    /// - [`AllowanceError::InsufficientAllowance`] if the remaining allowance is
+    ///   below `amount`.
+    /// - [`AllowanceError::HoldingCapExceeded`] if `to` would exceed the cap.
+    pub fn transfer_from(
+        env: Env,
+        spender: Address,
+        from: Address,
+        to: Address,
+        key_id: Address,
+        amount: u32,
+    ) -> Result<(), AllowanceError> {
+        spender.require_auth();
+        assert_not_paused(&env).map_err(|_| AllowanceError::ProtocolPaused)?;
+
+        if amount == 0 {
+            return Err(AllowanceError::ZeroAmount);
+        }
+        if from == to {
+            return Err(AllowanceError::SelfTransfer);
+        }
+        validate_non_zero_address(&env, &to).map_err(|_| AllowanceError::ZeroAddress)?;
+
+        let mut profile: CreatorProfile = read_registered_creator_profile(&env, &key_id)
+            .map_err(|_| AllowanceError::NotRegistered)?;
+
+        // Mirrors the buy-cooldown guard in `transfer_keys`: a delegating
+        // spender must not be able to route keys around the creator's cooldown.
+        let cooldown_ledgers: u32 = env
+            .storage()
+            .persistent()
+            .get(&constants::storage::buy_cooldown(&key_id))
+            .unwrap_or(0);
+        if cooldown_ledgers > 0 {
+            if let Some(last_ledger) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, u32>(&constants::storage::last_buy_ledger(&key_id, &from))
+            {
+                if env.ledger().sequence().saturating_sub(last_ledger) < cooldown_ledgers {
+                    return Err(AllowanceError::CooldownActive);
+                }
+            }
+        }
+
+        assert_position_not_frozen(&env, &key_id, &from)
+            .map_err(|_| AllowanceError::FrozenPosition)?;
+
+        // The allowance is checked before any balance is touched so a rejected
+        // call cannot leave a partially applied transfer behind.
+        let allowance_key = constants::storage::key_allowance(&from, &spender, &key_id);
+        let allowance: u32 = env.storage().persistent().get(&allowance_key).unwrap_or(0);
+        if allowance < amount {
+            return Err(AllowanceError::InsufficientAllowance);
+        }
+
+        let from_balance_key = constants::storage::holder_balance_key(&key_id, &from);
+        let from_balance: u32 = env
+            .storage()
+            .persistent()
+            .get(&from_balance_key)
+            .unwrap_or(0);
+        if from_balance < amount {
+            return Err(AllowanceError::InsufficientBalance);
+        }
+        if available_holder_balance(&env, &key_id, &from) < amount {
+            // Frozen keys are what make an otherwise sufficient balance unavailable.
+            return Err(AllowanceError::FrozenPosition);
+        }
+
+        let to_balance_key = constants::storage::holder_balance_key(&key_id, &to);
+        let to_balance: u32 = env.storage().persistent().get(&to_balance_key).unwrap_or(0);
+
+        // Settle dividends on both sides at their pre-transfer balances.
+        settle_holder_dividends(&env, &key_id, &from, from_balance)
+            .map_err(|_| AllowanceError::Overflow)?;
+        settle_holder_dividends(&env, &key_id, &to, to_balance)
+            .map_err(|_| AllowanceError::Overflow)?;
+
+        let new_from_balance = from_balance
+            .checked_sub(amount)
+            .ok_or(AllowanceError::InsufficientBalance)?;
+        let new_to_balance = to_balance
+            .checked_add(amount)
+            .ok_or(AllowanceError::Overflow)?;
+        assert_within_holding_cap(&env, &key_id, new_to_balance)
+            .map_err(|_| AllowanceError::HoldingCapExceeded)?;
+
+        // The recipient's cap check above already guarantees the write cannot
+        // fail, so the balance and allowance updates below are safe to apply
+        // unconditionally.
+        env.storage()
+            .persistent()
+            .set(&from_balance_key, &new_from_balance);
+        env.storage()
+            .persistent()
+            .set(&to_balance_key, &new_to_balance);
+        extend_key_ttl_to_full_window(&env, &from_balance_key);
+        extend_key_ttl_to_full_window(&env, &to_balance_key);
+
+        // The two adjustments below are mutually exclusive: `amount > 0` and
+        // `from != to`, so at most one side crosses the zero boundary.
+        let old_holder_count = profile.holder_count;
+        if new_from_balance == 0 {
+            profile.holder_count = profile
+                .holder_count
+                .checked_sub(1)
+                .ok_or(AllowanceError::Overflow)?;
+        }
+        if to_balance == 0 {
+            profile.holder_count = profile
+                .holder_count
+                .checked_add(1)
+                .ok_or(AllowanceError::Overflow)?;
+        }
+        let new_holder_count = profile.holder_count;
+        let profile_key = constants::storage::creator(&key_id);
+        env.storage().persistent().set(&profile_key, &profile);
+        extend_key_ttl_to_full_window(&env, &profile_key);
+
+        // Mirrors `transfer_keys` so indexers tracking holder counts see the
+        // delegated path too.
+        emit_holder_count_changed(&env, &key_id, old_holder_count, new_holder_count);
+
+        // Decrement the allowance in the same call as the transfer so it can
+        // never be spent twice.
+        let remaining_allowance = allowance - amount;
+        if remaining_allowance == 0 {
+            env.storage().persistent().remove(&allowance_key);
+        } else {
+            env.storage()
+                .persistent()
+                .set(&allowance_key, &remaining_allowance);
+            extend_key_ttl_to_full_window(&env, &allowance_key);
+        }
+
+        env.events().publish(
+            events::transfer_from_topics(&key_id, &spender),
+            events::TransferFromEvent {
+                key_id: key_id.clone(),
+                spender,
+                from,
+                to,
+                amount,
+                remaining_allowance,
+                ledger: env.ledger().sequence(),
+            },
+        );
+
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Feature: sell tax routed to the buyback pool
+    // -----------------------------------------------------------------------
+
+    /// Read-only view: returns a creator's configured sell tax in basis points.
+    ///
+    /// Returns `0` when no tax has been configured.
+    pub fn get_sell_tax_bps(env: Env, creator: Address) -> u32 {
+        let key = constants::storage::sell_tax_bps(&creator);
+        env.storage().persistent().get(&key).unwrap_or(0)
+    }
+
+    /// Sets the sell tax deducted from proceeds of `creator`'s key sales.
+    ///
+    /// Only `creator` may set their own tax. `tax_bps` must not exceed
+    /// [`MAX_SELL_TAX_BPS`]; passing `0` disables the tax. The collected tax is
+    /// forwarded to the buyback pool balance readable through
+    /// [`CreatorKeysContract::get_buyback_pool_balance`].
+    ///
+    /// # Errors
+    /// - [`SellTaxError::Unauthorized`] if `caller` is not the creator.
+    /// - [`SellTaxError::NotRegistered`] if the creator is not registered.
+    /// - [`SellTaxError::TaxExceedsMax`] if `tax_bps` exceeds the ceiling.
+    pub fn set_sell_tax_bps(
+        env: Env,
+        caller: Address,
+        creator: Address,
+        tax_bps: u32,
+    ) -> Result<(), SellTaxError> {
+        caller.require_auth();
+        if caller != creator {
+            return Err(SellTaxError::Unauthorized);
+        }
+        read_registered_creator_profile(&env, &creator).map_err(|_| SellTaxError::NotRegistered)?;
+        if tax_bps > MAX_SELL_TAX_BPS {
+            return Err(SellTaxError::TaxExceedsMax);
+        }
+
+        let key = constants::storage::sell_tax_bps(&creator);
+        let old_tax_bps: u32 = env.storage().persistent().get(&key).unwrap_or(0);
+
+        if tax_bps == 0 {
+            env.storage().persistent().remove(&key);
+        } else {
+            env.storage().persistent().set(&key, &tax_bps);
+            extend_key_ttl_to_full_window(&env, &key);
+        }
+
+        env.events().publish(
+            events::sell_tax_updated_topics(&creator),
+            events::SellTaxUpdatedEvent {
+                creator,
+                old_tax_bps,
+                new_tax_bps: tax_bps,
+                ledger: env.ledger().sequence(),
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Read-only view: returns the current buyback pool balance in XLM stroops
+    /// alongside the address it is credited to.
+    ///
+    /// The balance accumulates the sell tax collected by every key, and starts
+    /// at `0` with no pool address configured.
+    pub fn get_buyback_pool_balance(env: Env) -> (i128, Option<Address>) {
+        let balance: i128 = env
+            .storage()
+            .persistent()
+            .get(&constants::storage::BUYBACK_POOL_BALANCE)
+            .unwrap_or(0);
+        let pool: Option<Address> = env
+            .storage()
+            .persistent()
+            .get(&constants::storage::BUYBACK_POOL_ADDRESS);
+        (balance, pool)
+    }
+
+    /// Sets the address credited with the buyback pool balance (admin only).
+    ///
+    /// # Errors
+    /// - [`SellTaxError::ZeroAddress`] is not used here; the zero address is
+    ///   rejected by the shared address validator surfaced as
+    ///   [`ContractError::ZeroAddress`].
+    pub fn set_buyback_pool_address(
+        env: Env,
+        admin: Address,
+        pool: Address,
+    ) -> Result<(), ContractError> {
+        admin.require_auth();
+        assert_is_admin(&env, &admin)?;
+        validate_non_zero_address(&env, &pool)?;
+        let key = constants::storage::BUYBACK_POOL_ADDRESS;
+        env.storage().persistent().set(&key, &pool);
+        extend_key_ttl_to_full_window(&env, &key);
+        Ok(())
+    }
+
+    /// Deducts `creator`'s configured sell tax from `gross_proceeds` and credits
+    /// it to the buyback pool.
+    ///
+    /// Returns `(net_proceeds, tax_amount, pool_balance_after)`. A creator with
+    /// no configured tax, a `0` tax, or proceeds too small for the tax to floor
+    /// to a non-zero amount all return the full proceeds with no pool credit.
+    ///
+    /// The pool balance is written in the same call that computes the tax, so a
+    /// sell either credits the pool and reduces the seller's proceeds, or leaves
+    /// both untouched.
+    fn collect_sell_tax(
+        env: &Env,
+        creator: &Address,
+        gross_proceeds: i128,
+    ) -> Result<(i128, i128, i128), ContractError> {
+        let tax_bps: u32 = env
+            .storage()
+            .persistent()
+            .get(&constants::storage::sell_tax_bps(creator))
+            .unwrap_or(0);
+        if tax_bps == 0 {
+            return Ok((gross_proceeds, 0, 0));
+        }
+
+        let tax_amount = fee::apply_percentage_fee(gross_proceeds, tax_bps)
+            .ok_or(ContractError::Overflow)?
+            .min(gross_proceeds);
+        if tax_amount <= 0 {
+            return Ok((gross_proceeds, 0, 0));
+        }
+
+        let pool_key = constants::storage::BUYBACK_POOL_BALANCE;
+        let current_balance: i128 = env.storage().persistent().get(&pool_key).unwrap_or(0);
+        let new_balance = current_balance
+            .checked_add(tax_amount)
+            .ok_or(ContractError::Overflow)?;
+        env.storage().persistent().set(&pool_key, &new_balance);
+        extend_key_ttl_to_full_window(env, &pool_key);
+
+        Ok((gross_proceeds - tax_amount, tax_amount, new_balance))
+    }
+
+    // -----------------------------------------------------------------------
+    // Feature: governance quorum escalation
+    // -----------------------------------------------------------------------
+
+    /// Read-only view: returns the protocol-wide quorum-escalation config.
+    ///
+    /// `None` means escalation is disabled, which is the default until an admin
+    /// calls [`CreatorKeysContract::set_escalation_config`].
+    pub fn get_escalation_config(env: Env) -> Option<EscalationConfig> {
+        env.storage()
+            .persistent()
+            .get(&constants::storage::ESCALATION_CONFIG)
+    }
+
+    /// Configures the protocol-wide quorum-escalation parameters (admin only).
+    ///
+    /// `threshold_bps` is the fraction of the proposal's own quorum requirement
+    /// that must already be met before an extension is granted, and must be
+    /// between [`MIN_ESCALATION_THRESHOLD_BPS`] and
+    /// [`MAX_ESCALATION_THRESHOLD_BPS`]. `extension_ledgers` must be positive
+    /// and no greater than [`MAX_ESCALATION_EXTENSION_LEDGERS`]. `max_extensions`
+    /// must be no greater than [`MAX_ESCALATION_EXTENSIONS_BOUND`].
+    ///
+    /// Setting `max_extensions` to `0` disables escalation for every proposal
+    /// while leaving the rest of the config readable.
+    ///
+    /// # Errors
+    /// - [`EscalationError::Unauthorized`] if `admin` is not the protocol admin.
+    /// - [`EscalationError::InvalidEscalationConfig`] if any bound is violated.
+    pub fn set_escalation_config(
+        env: Env,
+        admin: Address,
+        config: EscalationConfig,
+    ) -> Result<(), EscalationError> {
+        admin.require_auth();
+        assert_is_admin(&env, &admin).map_err(|_| EscalationError::Unauthorized)?;
+
+        if config.threshold_bps < MIN_ESCALATION_THRESHOLD_BPS
+            || config.threshold_bps > MAX_ESCALATION_THRESHOLD_BPS
+            || config.extension_ledgers == 0
+            || config.extension_ledgers > MAX_ESCALATION_EXTENSION_LEDGERS
+            || config.max_extensions > MAX_ESCALATION_EXTENSIONS_BOUND
+        {
+            return Err(EscalationError::InvalidEscalationConfig);
+        }
+
+        let old_config: Option<EscalationConfig> = env
+            .storage()
+            .persistent()
+            .get(&constants::storage::ESCALATION_CONFIG);
+
+        let key = constants::storage::ESCALATION_CONFIG;
+        env.storage().persistent().set(&key, &config);
+        extend_key_ttl_to_full_window(&env, &key);
+
+        env.events().publish(
+            events::escalation_config_updated_topics(&admin),
+            events::EscalationConfigUpdatedEvent {
+                admin,
+                had_previous_config: old_config.is_some(),
+                old_threshold_bps: old_config.map(|c| c.threshold_bps).unwrap_or(0),
+                old_extension_ledgers: old_config.map(|c| c.extension_ledgers).unwrap_or(0),
+                old_max_extensions: old_config.map(|c| c.max_extensions).unwrap_or(0),
+                new_threshold_bps: config.threshold_bps,
+                new_extension_ledgers: config.extension_ledgers,
+                new_max_extensions: config.max_extensions,
+                ledger: env.ledger().sequence(),
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Read-only view: returns a proposal's quorum-escalation state.
+    ///
+    /// Reports the deadline, how many extensions have been consumed, current
+    /// participation against the proposal's quorum requirement, and whether the
+    /// proposal is eligible for or has exhausted further extension.
+    pub fn get_escalation_status(
+        env: Env,
+        creator_id: Address,
+        poll_id: u32,
+    ) -> Result<EscalationView, EscalationError> {
+        let poll = events::read_poll(&env, &creator_id, poll_id)
+            .map_err(|_| EscalationError::PollNotFound)?;
+
+        let extensions_used = events::read_poll_extension_count(&env, &creator_id, poll_id);
+        let config = Self::get_escalation_config(env.clone());
+        let max_extensions = config.map(|c| c.max_extensions).unwrap_or(0);
+        let threshold_bps = config.map(|c| c.threshold_bps).unwrap_or(0);
+
+        let now = env.ledger().sequence();
+        let ledgers_remaining = poll.expires_at.saturating_sub(now);
+
+        let circulating_supply = read_creator_supply(&env, &creator_id);
+        let quorum_bps: u32 = env
+            .storage()
+            .persistent()
+            .get(&constants::storage::quorum_bps(&creator_id))
+            .unwrap_or(0);
+
+        let participation_bps = if circulating_supply == 0 {
+            0
+        } else {
+            ((poll.total_weight as u128 * 10_000) / circulating_supply as u128) as u32
+        };
+
+        let eligible = is_escalation_eligible(
+            participation_bps,
+            quorum_bps,
+            threshold_bps,
+            max_extensions,
+            extensions_used,
+        );
+
+        // Matches `events::poll_extensions_exhausted`: a zero budget means
+        // escalation is off, which is not the same as a spent budget.
+        let exhausted = max_extensions > 0 && extensions_used >= max_extensions;
+
+        Ok(EscalationView {
+            poll_id,
+            expires_at: poll.expires_at,
+            extensions_used,
+            max_extensions,
+            ledgers_remaining,
+            participation_bps,
+            quorum_bps,
+            eligible,
+            exhausted,
+        })
+    }
+
+    /// Extends a proposal's voting period when it is close to quorum but has
+    /// not reached it.
+    ///
+    /// Soroban has no scheduled execution, so this evaluation is permissionless
+    /// and deterministic: anyone may call it, but the outcome depends only on
+    /// stored state. A proposal is extended when all of the following hold:
+    ///
+    /// 1. Quorum escalation is configured (otherwise
+    ///    [`EscalationError::EscalationDisabled`]).
+    /// 2. The proposal exists and is not already closed.
+    /// 3. The current ledger is within
+    ///    [`ESCALATION_EVALUATION_WINDOW_LEDGERS`] of the deadline, so a
+    ///    proposal cannot be extended long before it would close.
+    /// 4. Participation has reached `threshold_bps` of the proposal's own
+    ///    quorum requirement (`quorum_bps` of circulating supply).
+    /// 5. The proposal has not consumed `max_extensions` extensions.
+    ///
+    /// Extending adds `extension_ledgers` to the deadline and increments the
+    /// consumed-extension count, so a proposal can be postponed at most
+    /// `max_extensions` times. Once exhausted, the proposal closes on its
+    /// existing deadline whether or not it reached quorum.
+    ///
+    /// # Errors
+    /// - [`EscalationError::EscalationDisabled`] if no config is set.
+    /// - [`EscalationError::PollNotFound`] if the proposal does not exist.
+    /// - [`EscalationError::AlreadyClosed`] if the proposal is closed.
+    /// - [`EscalationError::TooEarlyToEscalate`] if the deadline is too far away.
+    /// - [`EscalationError::BelowEscalationThreshold`] if participation is too low.
+    /// - [`EscalationError::MaxExtensionsReached`] if extensions are exhausted.
+    pub fn evaluate_poll_escalation(
+        env: Env,
+        creator_id: Address,
+        poll_id: u32,
+    ) -> Result<u32, EscalationError> {
+        let config =
+            Self::get_escalation_config(env.clone()).ok_or(EscalationError::EscalationDisabled)?;
+        if config.max_extensions == 0 {
+            return Err(EscalationError::EscalationDisabled);
+        }
+
+        let mut poll = events::read_poll(&env, &creator_id, poll_id)
+            .map_err(|_| EscalationError::PollNotFound)?;
+        if poll.closed {
+            return Err(EscalationError::AlreadyClosed);
+        }
+
+        let now = env.ledger().sequence();
+        if now.saturating_add(ESCALATION_EVALUATION_WINDOW_LEDGERS) < poll.expires_at {
+            return Err(EscalationError::TooEarlyToEscalate);
+        }
+
+        let extensions_used = events::read_poll_extension_count(&env, &creator_id, poll_id);
+        if extensions_used >= config.max_extensions {
+            return Err(EscalationError::MaxExtensionsReached);
+        }
+
+        let circulating_supply = read_creator_supply(&env, &creator_id);
+        let quorum_bps: u32 = env
+            .storage()
+            .persistent()
+            .get(&constants::storage::quorum_bps(&creator_id))
+            .unwrap_or(0);
+        let participation_bps =
+            escalation_participation_bps(poll.total_weight, circulating_supply)?;
+
+        if !is_escalation_eligible(
+            participation_bps,
+            quorum_bps,
+            config.threshold_bps,
+            config.max_extensions,
+            extensions_used,
+        ) {
+            return Err(EscalationError::BelowEscalationThreshold);
+        }
+
+        let old_expires_at = poll.expires_at;
+        let new_expires_at = old_expires_at
+            .checked_add(config.extension_ledgers)
+            .ok_or(EscalationError::Overflow)?;
+        poll.expires_at = new_expires_at;
+        events::write_poll(&env, &creator_id, poll_id, &poll);
+
+        let extensions_used = extensions_used
+            .checked_add(1)
+            .ok_or(EscalationError::Overflow)?;
+        events::write_poll_extension_count(&env, &creator_id, poll_id, extensions_used);
+
+        env.events().publish(
+            events::proposal_extended_topics(&creator_id, poll_id),
+            events::ProposalExtendedEvent {
+                creator_id,
+                poll_id,
+                old_expires_at,
+                new_expires_at,
+                extensions_used,
+                max_extensions: config.max_extensions,
+                ledger: env.ledger().sequence(),
+            },
+        );
+
+        Ok(new_expires_at)
     }
 }
 #[cfg(test)]
