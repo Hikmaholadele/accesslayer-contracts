@@ -847,6 +847,10 @@ pub mod constants {
             DataKey::VaultRewardPending(creator.clone(), holder.clone())
         }
 
+        pub fn delegate(creator: &Address, delegator: &Address) -> DataKey {
+            DataKey::Delegate(creator.clone(), delegator.clone())
+        }
+
         pub fn fee_router() -> DataKey {
             DataKey::FeeRouter
         }
@@ -1548,6 +1552,8 @@ pub enum DataKey {
     VaultRewardCheckpoint(Address, Address),
     /// (creator, holder) -> settled but unclaimed vault rewards.
     VaultRewardPending(Address, Address),
+    /// (creator, delegator) -> delegate wallet for governance.
+    Delegate(Address, Address),
     /// Address of the authorised fee router that may call `topup_reward_pool`.
     FeeRouter,
     /// Global staker reward pool balance (in stroops).
@@ -1560,6 +1566,7 @@ pub enum DataKey {
     UniqueTraderCount(Address),
     /// Per-creator per-wallet flag: true if this wallet has ever traded.
     HasTraded(Address, Address),
+
     /// (creator) -> accumulated reputation score (`i128`, floored at zero).
     ReputationScore(Address),
     /// (creator) -> per-reason contribution breakdown backing the reputation score.
@@ -10854,6 +10861,11 @@ impl CreatorKeysContract {
             return Err(PollError::InvalidOption);
         }
 
+        let delegate_key = constants::storage::delegate(&creator_id, &voter);
+        if env.storage().persistent().has(&delegate_key) {
+            return Err(PollError::Unauthorized);
+        }
+
         // Check for existing snapshot; if none, capture current balance as snapshot
         let snapshot_key = DataKey::VoteSnapshot(creator_id.clone(), poll_id, voter.clone());
         let weight: u32 = if let Some(snap) = env
@@ -10941,6 +10953,160 @@ impl CreatorKeysContract {
         env.storage()
             .persistent()
             .get(&DataKey::VoteSnapshot(creator_id, poll_id, voter))
+    }
+
+    // =========================================================================
+    // Delegated Voting
+    // =========================================================================
+
+    /// Assigns voting power to a delegate wallet.
+    pub fn delegate(env: Env, creator_id: Address, delegator: Address, delegate: Address) {
+        delegator.require_auth();
+        let delegate_key = constants::storage::delegate(&creator_id, &delegator);
+        env.storage().persistent().set(&delegate_key, &delegate);
+        extend_key_ttl_to_full_window(&env, &delegate_key);
+
+        env.events().publish(
+            events::delegation_set_topics(&creator_id, &delegator),
+            events::DelegationSetEvent {
+                creator: creator_id,
+                delegator,
+                delegate,
+            },
+        );
+    }
+
+    /// Revokes a previous delegation.
+    pub fn revoke_delegate(env: Env, creator_id: Address, delegator: Address) {
+        delegator.require_auth();
+        let delegate_key = constants::storage::delegate(&creator_id, &delegator);
+        env.storage().persistent().remove(&delegate_key);
+
+        env.events().publish(
+            events::delegation_revoked_topics(&creator_id, &delegator),
+            events::DelegationRevokedEvent {
+                creator: creator_id,
+                delegator,
+            },
+        );
+    }
+
+    /// Read-only view: returns the current delegate for a wallet.
+    pub fn get_delegate(env: Env, creator_id: Address, delegator: Address) -> Option<Address> {
+        env.storage()
+            .persistent()
+            .get(&constants::storage::delegate(&creator_id, &delegator))
+    }
+
+    /// Casts a vote on behalf of delegators using their delegated weight.
+    pub fn cast_delegated_vote(
+        env: Env,
+        creator_id: Address,
+        delegate: Address,
+        delegators: Vec<Address>,
+        poll_id: u32,
+        option_index: u32,
+    ) -> Result<(), crate::events::PollError> {
+        use crate::events::{PollError, PollVote, POLL_VOTE_EVENT_NAME};
+
+        delegate.require_auth();
+        let mut poll = events::read_poll(&env, &creator_id, poll_id)?;
+
+        if events::is_poll_expired(&env, &poll) {
+            return Err(PollError::PollExpired);
+        }
+        if option_index >= poll.options.len() {
+            return Err(PollError::InvalidOption);
+        }
+
+        for delegator in delegators.iter() {
+            let actual_delegate: Option<Address> = env
+                .storage()
+                .persistent()
+                .get(&constants::storage::delegate(&creator_id, &delegator));
+            if actual_delegate != Some(delegate.clone()) {
+                return Err(PollError::Unauthorized);
+            }
+
+            let snapshot_key =
+                DataKey::VoteSnapshot(creator_id.clone(), poll_id, delegator.clone());
+            let weight: u32 = if let Some(snap) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, u32>(&snapshot_key)
+            {
+                snap
+            } else {
+                let balance_key = constants::storage::holder_balance_key(&creator_id, &delegator);
+                let balance: u32 = env.storage().persistent().get(&balance_key).unwrap_or(0);
+                if balance == 0 {
+                    continue;
+                }
+                env.storage().persistent().set(&snapshot_key, &balance);
+                balance
+            };
+
+            if weight == 0 {
+                continue;
+            }
+
+            let vote_key = events::vote_storage_key(&creator_id, poll_id, &delegator);
+            if let Some(previous_vote) = env
+                .storage()
+                .persistent()
+                .get::<events::PollDataKey, PollVote>(&vote_key)
+            {
+                let previous_count = poll
+                    .vote_counts
+                    .get(previous_vote.option_index)
+                    .ok_or(PollError::InvalidOption)?;
+                let updated_previous_count = previous_count
+                    .checked_sub(previous_vote.weight)
+                    .ok_or(PollError::Overflow)?;
+                poll.vote_counts
+                    .set(previous_vote.option_index, updated_previous_count);
+                poll.total_weight = poll
+                    .total_weight
+                    .checked_sub(previous_vote.weight)
+                    .ok_or(PollError::Overflow)?;
+            }
+
+            let selected_count = poll
+                .vote_counts
+                .get(option_index)
+                .ok_or(PollError::InvalidOption)?;
+            let updated_selected_count = selected_count
+                .checked_add(weight)
+                .ok_or(PollError::Overflow)?;
+            poll.vote_counts.set(option_index, updated_selected_count);
+            poll.total_weight = poll
+                .total_weight
+                .checked_add(weight)
+                .ok_or(PollError::Overflow)?;
+
+            env.storage().persistent().set(
+                &vote_key,
+                &PollVote {
+                    option_index,
+                    weight,
+                },
+            );
+            env.events().publish(
+                (
+                    POLL_VOTE_EVENT_NAME,
+                    creator_id.clone(),
+                    poll_id,
+                    delegator.clone(),
+                ),
+                (option_index, weight),
+            );
+        }
+
+        env.storage()
+            .persistent()
+            .set(&events::poll_storage_key(&creator_id, poll_id), &poll);
+
+        Ok(())
     }
 
     // =========================================================================
