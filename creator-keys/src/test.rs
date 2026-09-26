@@ -1860,16 +1860,9 @@ fn test_buy_event_topic_and_data_order_is_stable() {
     let buyer = Address::generate(&env);
     client.buy_key(&creator, &buyer, &500, &None);
 
-    let all_events = env.events().all();
-    // buy_key may emit a HolderCountChangedEvent (new holder) before the buy event;
-    // the buy event is always last.
-    assert!(!all_events.is_empty(), "expected at least one buy event");
-
-    let (_contract_id, topics, data): (
-        Address,
-        soroban_sdk::Vec<soroban_sdk::Val>,
-        soroban_sdk::Val,
-    ) = all_events.get(all_events.len() - 1).unwrap();
+    // buy_key emits several events per call (holder-count change, reputation
+    // update), so the buy event is selected by name rather than by position.
+    let (topics, data) = find_event_by_name(&env, events::BUY_EVENT_NAME);
 
     // Topic[0] = event name, Topic[1] = creator, Topic[2] = buyer
     let event_name: soroban_sdk::Symbol = topics
@@ -1994,6 +1987,29 @@ fn assert_no_events(env: &Env) {
         "Expected no events to be emitted, but found: {:?}",
         all_events
     );
+}
+
+/// Returns the topics and data of the last event carrying `name`.
+///
+/// Trade entrypoints emit several events per call (holder-count changes,
+/// reputation updates, fee collection), so tests that want one specific event
+/// must select it by name rather than by position.
+fn find_event_by_name(
+    env: &Env,
+    name: soroban_sdk::Symbol,
+) -> (soroban_sdk::Vec<soroban_sdk::Val>, soroban_sdk::Val) {
+    let all_events = env.events().all();
+    for (_, topics, data) in all_events.iter() {
+        let event_name: soroban_sdk::Symbol = topics
+            .get(events::TOPIC_EVENT_NAME_INDEX)
+            .unwrap()
+            .try_into_val(env)
+            .unwrap();
+        if event_name == name {
+            return (topics, data);
+        }
+    }
+    panic!("no event named {:?} was emitted", name);
 }
 
 // --- Checked-Addition Helper Tests (#216) ---
@@ -2895,14 +2911,7 @@ fn test_buy_and_sell_events_contain_matching_creator_id() {
     // Perform buy and extract the buy event
     client.buy_key(&creator, &buyer, &100, &None);
 
-    let all_events = env.events().all();
-    assert!(!all_events.is_empty(), "expected at least one buy event");
-
-    let (_contract_id, _topics, data): (
-        Address,
-        soroban_sdk::Vec<soroban_sdk::Val>,
-        soroban_sdk::Val,
-    ) = all_events.get(all_events.len() - 1).unwrap();
+    let (_topics, data) = find_event_by_name(&env, events::BUY_EVENT_NAME);
 
     let buy_event: events::KeysBoughtEvent = data.try_into_val(&env).unwrap();
     assert_eq!(
@@ -2916,14 +2925,7 @@ fn test_buy_and_sell_events_contain_matching_creator_id() {
         .set_sequence_number(env.ledger().sequence() + 1);
     client.sell_key(&creator, &buyer, &None);
 
-    let all_events = env.events().all();
-    assert!(!all_events.is_empty(), "expected at least one sell event");
-
-    let (_contract_id, _topics, data): (
-        Address,
-        soroban_sdk::Vec<soroban_sdk::Val>,
-        soroban_sdk::Val,
-    ) = all_events.get(all_events.len() - 1).unwrap();
+    let (_topics, data) = find_event_by_name(&env, events::SELL_EVENT_NAME);
 
     let sell_event: events::KeysSoldEvent = data.try_into_val(&env).unwrap();
     assert_eq!(
