@@ -154,7 +154,7 @@ fn redeem_on_unregistered_creator_returns_not_registered() {
 
 #[test]
 fn key_not_deprecated_discriminant_is_stable() {
-    assert_eq!(ContractError::KeyNotDeprecated as u32, 72);
+    assert_eq!(ContractError::KeyNotDeprecated as u32, 82);
 }
 
 // ---------------------------------------------------------------------------

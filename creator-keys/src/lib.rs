@@ -111,11 +111,6 @@ pub enum ContractError {
     BatchSizeExceeded = 70,
     /// The requested holder snapshot does not exist.
     SnapshotNotFound = 71,
-    /// `redeem` was called on a key that has not been deprecated by its creator.
-    KeyNotDeprecated = 72,
-}
-
-/// Errors raised by the staking lifecycle entrypoints
     /// The sender's keys are frozen and cannot be transferred.
     FrozenPosition = 72,
     /// The requested buy cooldown exceeds `MAX_BUY_COOLDOWN_LEDGERS` at registration.
@@ -136,6 +131,8 @@ pub enum ContractError {
     FeeRouterNotSet = 80,
     /// The spread basis-points value is invalid (reserved for future validation).
     InvalidSpreadConfig = 81,
+    /// `redeem` was called on a key that has not been deprecated by its creator.
+    KeyNotDeprecated = 82,
 }
 
 /// Errors raised by the staking entrypoints
