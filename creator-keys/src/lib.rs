@@ -108,6 +108,9 @@ pub enum ContractError {
     BatchSizeExceeded = 70,
     /// The requested holder snapshot does not exist.
     SnapshotNotFound = 71,
+    /// A timed pause duration was invalid: `pause_with_expiry` requires
+    /// `duration_ledgers` in the inclusive range `1..=17_280`.
+    PauseTooLong = 72,
 }
 
 /// Errors raised by the staking lifecycle entrypoints
