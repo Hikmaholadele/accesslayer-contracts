@@ -2350,6 +2350,34 @@ pub fn price_queried_topics(caller: &Address) -> (Symbol, Address) {
     (PRICE_QUERIED_EVENT_NAME, caller.clone())
 }
 
+// ============================================================================
+// Claimable dividends (issue #857)
+// ============================================================================
+
+/// Event name for a per-holder dividend credit written at distribution time.
+pub const DIVIDEND_CREDITED_EVENT_NAME: Symbol = symbol_short!("div_crd");
+
+/// Stable field order for `dividend_credited` payloads.
+pub const DIVIDEND_CREDITED_DATA_FIELDS: [&str; 3] = ["creator", "holder", "amount"];
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct DividendCreditedEvent {
+    pub creator: Address,
+    pub holder: Address,
+    pub amount: i128,
+}
+
+pub fn dividend_credited_topics(creator: &Address, holder: &Address) -> (Symbol, Address, Address) {
+    (
+        DIVIDEND_CREDITED_EVENT_NAME,
+        creator.clone(),
+        holder.clone(),
+    )
+}
+
+// ============================================================================
+
 // --- Pause state change (#889) ---
 
 pub const PAUSE_STATE_CHANGED_EVENT_NAME: Symbol = symbol_short!("pause_chg");

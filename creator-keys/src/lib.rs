@@ -612,6 +612,11 @@ pub mod constants {
             DataKey::HolderDividendPending(creator.clone(), holder.clone())
         }
 
+        /// (creator, holder) -> unclaimed claim-based dividend balance (issue #857).
+        pub fn unclaimed_dividend(creator: &Address, holder: &Address) -> DataKey {
+            DataKey::UnclaimedDividend(creator.clone(), holder.clone())
+        }
+
         pub fn locked_allocation(creator: &Address) -> DataKey {
             DataKey::LockedAllocation(creator.clone())
         }
@@ -1411,6 +1416,8 @@ pub enum DataKey {
     DividendPerKeyAccumulated(Address),
     HolderDividendCheckpoint(Address, Address),
     HolderDividendPending(Address, Address),
+    /// (creator, holder) -> unclaimed claim-based dividend balance (issue #857).
+    UnclaimedDividend(Address, Address),
     LockedAllocation(Address),
     MaxSupply(Address),
     CurveSlope,
@@ -8498,6 +8505,134 @@ impl CreatorKeysContract {
         Ok(claimable)
     }
 
+    /// Distributes `total_amount` to the supplied holders using the claim-based
+    /// model (issue #857).
+    ///
+    /// Unlike `distribute_dividend`, this does **not** move any balance at
+    /// distribution time: each holder's pro-rata share is written to
+    /// `DataKey::UnclaimedDividend` and the holder pulls it later via
+    /// `claim_dividend_claimable`.
+    ///
+    /// Authorization: creator-only. The open-caller `distribute_dividend`
+    /// is left unchanged.
+    ///
+    /// `holders` is caller-supplied (matching `take_snapshot`) because Soroban
+    /// storage cannot be enumerated on-chain.
+    pub fn distribute_dividend_claimable(
+        env: Env,
+        creator: Address,
+        total_amount: i128,
+        holders: Vec<Address>,
+    ) -> Result<(), ContractError> {
+        creator.require_auth();
+        assert_not_paused(&env)?;
+
+        if total_amount <= 0 {
+            return Err(ContractError::ZeroDistributionAmount);
+        }
+
+        let profile = read_registered_creator_profile(&env, &creator)?;
+        if profile.supply == 0 || holders.is_empty() {
+            return Err(ContractError::NoKeyHolders);
+        }
+
+        let config = read_required_protocol_fee_config(&env)?;
+        let (net_amount, protocol_amount) =
+            fee::compute_fee_split(total_amount, config.creator_bps, config.protocol_bps);
+
+        credit_protocol_fee_recipient_balance(&env, protocol_amount)?;
+
+        let per_key_net = net_amount / profile.supply as i128;
+
+        for holder in holders.iter() {
+            let balance_key = constants::storage::holder_balance_key(&creator, &holder);
+            let holder_balance: u32 = env.storage().persistent().get(&balance_key).unwrap_or(0);
+
+            if holder_balance == 0 {
+                continue;
+            }
+
+            let share = per_key_net
+                .checked_mul(holder_balance as i128)
+                .ok_or(ContractError::Overflow)?;
+
+            let unclaimed_key = constants::storage::unclaimed_dividend(&creator, &holder);
+            let prior: i128 = env.storage().persistent().get(&unclaimed_key).unwrap_or(0);
+            let new_balance = fee::checked_accumulate(prior, share)?;
+            env.storage().persistent().set(&unclaimed_key, &new_balance);
+            extend_key_ttl_to_full_window(&env, &unclaimed_key);
+
+            env.events().publish(
+                events::dividend_credited_topics(&creator, &holder),
+                events::DividendCreditedEvent {
+                    creator: creator.clone(),
+                    holder: holder.clone(),
+                    amount: share,
+                },
+            );
+        }
+
+        env.events().publish(
+            events::dividend_distributed_topics(&creator),
+            events::DividendDistributedEvent {
+                creator: creator.clone(),
+                total_amount,
+                snapshot_supply: profile.supply,
+                ledger: env.ledger().sequence(),
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Claims the caller's unclaimed claim-based dividend balance for `creator`
+    /// (issue #857).
+    ///
+    /// Credits the caller's `HolderDividendPending` balance (the internal-ledger
+    /// equivalent of a wallet payout in this contract, which has no SEP-41
+    /// transfer), zeros the `UnclaimedDividend` entry, and emits
+    /// `DividendClaimedEvent`.
+    pub fn claim_dividend_claimable(
+        env: Env,
+        creator: Address,
+        holder: Address,
+    ) -> Result<i128, ContractError> {
+        holder.require_auth();
+        assert_not_paused(&env)?;
+
+        let unclaimed_key = constants::storage::unclaimed_dividend(&creator, &holder);
+        let amount: i128 = env.storage().persistent().get(&unclaimed_key).unwrap_or(0);
+
+        if amount == 0 {
+            return Err(ContractError::NoDividendClaimable);
+        }
+
+        let pending_key = constants::storage::holder_dividend_pending(&creator, &holder);
+        let prior_pending: i128 = env.storage().persistent().get(&pending_key).unwrap_or(0);
+        let new_pending = fee::checked_accumulate(prior_pending, amount)?;
+        env.storage().persistent().set(&pending_key, &new_pending);
+        extend_key_ttl_to_full_window(&env, &pending_key);
+
+        env.storage().persistent().set(&unclaimed_key, &0i128);
+        extend_key_ttl_to_full_window(&env, &unclaimed_key);
+
+        env.events().publish(
+            events::dividend_claimed_topics(&creator, &holder),
+            events::DividendClaimedEvent {
+                creator: creator.clone(),
+                claimant: holder.clone(),
+                amount,
+            },
+        );
+
+        Ok(amount)
+    }
+
+    /// Read-only view of a holder's unclaimed claim-based dividend balance.
+    pub fn get_unclaimed_dividend(env: Env, creator: Address, holder: Address) -> i128 {
+        let key = constants::storage::unclaimed_dividend(&creator, &holder);
+        env.storage().persistent().get(&key).unwrap_or(0)
+    }
     pub fn batch_claim_dividend(
         env: Env,
         creators: soroban_sdk::Vec<Address>,
