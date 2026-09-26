@@ -2439,3 +2439,164 @@ pub fn action_executed_topics(action_id: u32) -> (Symbol, u32) {
 pub fn action_cancelled_topics(action_id: u32) -> (Symbol, u32) {
     (ACTION_CANCELLED_EVENT_NAME, action_id)
 }
+
+// ============================================================================
+// Feature: holder_count tracking — HolderCountChanged event
+// ============================================================================
+
+/// Event name emitted when the holder count for a creator key changes.
+pub const HOLDER_COUNT_CHANGED_EVENT_NAME: Symbol = symbol_short!("hc_chg");
+
+/// Stable holder-count-changed event payload for downstream indexers.
+///
+/// Event shape:
+/// - topics: `(HOLDER_COUNT_CHANGED_EVENT_NAME, creator_id)`
+/// - data: `HolderCountChangedEvent`
+///
+/// Emitted every time a wallet crosses the zero-balance boundary (first buy
+/// increments, full exit decrements).
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct HolderCountChangedEvent {
+    /// Creator whose holder count changed.
+    pub creator_id: Address,
+    /// Holder count before the change.
+    pub old_count: u32,
+    /// Holder count after the change.
+    pub new_count: u32,
+    /// Ledger sequence number at the time of the change.
+    pub ledger: u32,
+}
+
+/// Shared holder-count-changed event topics tuple.
+pub fn holder_count_changed_topics(creator_id: &Address) -> (Symbol, Address) {
+    (HOLDER_COUNT_CHANGED_EVENT_NAME, creator_id.clone())
+}
+
+// ============================================================================
+// Feature: update_metadata / update_config events
+// ============================================================================
+
+/// Event name emitted when a creator updates their key metadata.
+pub const METADATA_UPDATED_EVENT_NAME: Symbol = symbol_short!("meta_upd");
+
+/// Stable metadata-updated event payload for downstream indexers.
+///
+/// Event shape:
+/// - topics: `(METADATA_UPDATED_EVENT_NAME, creator_id)`
+/// - data: `MetadataUpdatedEvent`
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct MetadataUpdatedEvent {
+    /// Creator whose metadata was updated.
+    pub creator_id: Address,
+    /// Updated name, or empty string if unchanged.
+    pub name: String,
+    /// Updated bio, or empty string if unchanged.
+    pub bio: String,
+    /// Updated avatar URI, or empty string if unchanged.
+    pub avatar_uri: String,
+    /// Ledger sequence number at the time of the update.
+    pub ledger: u32,
+}
+
+/// Shared metadata-updated event topics tuple.
+pub fn metadata_updated_topics(creator_id: &Address) -> (Symbol, Address) {
+    (METADATA_UPDATED_EVENT_NAME, creator_id.clone())
+}
+
+/// Event name emitted when the admin updates protocol config parameters.
+pub const CONFIG_UPDATED_EVENT_NAME: Symbol = symbol_short!("cfg_upd");
+
+/// Stable config-updated event payload for downstream indexers.
+///
+/// Event shape:
+/// - topics: `(CONFIG_UPDATED_EVENT_NAME, admin)`
+/// - data: `ConfigUpdatedEvent`
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct ConfigUpdatedEvent {
+    /// Admin who performed the update.
+    pub admin: Address,
+    /// New creator fee basis points.
+    pub creator_bps: u32,
+    /// New protocol fee basis points.
+    pub protocol_bps: u32,
+    /// New bonding curve slope.
+    pub curve_slope: i128,
+    /// Ledger sequence number at the time of the update.
+    pub ledger: u32,
+}
+
+/// Shared config-updated event topics tuple.
+pub fn config_updated_topics(admin: &Address) -> (Symbol, Address) {
+    (CONFIG_UPDATED_EVENT_NAME, admin.clone())
+}
+
+// ============================================================================
+// Feature: snapshot mechanism — governance address set/get events
+// ============================================================================
+
+/// Event name emitted when the governance contract address is configured.
+pub const GOVERNANCE_ADDRESS_SET_EVENT_NAME: Symbol = symbol_short!("gov_set");
+
+/// Shared governance-address-set event topics tuple.
+pub fn governance_address_set_topics(admin: &Address) -> (Symbol, Address) {
+    (GOVERNANCE_ADDRESS_SET_EVENT_NAME, admin.clone())
+}
+
+/// Event name emitted when an old snapshot is pruned.
+pub const SNAPSHOT_PRUNED_EVENT_NAME: Symbol = symbol_short!("snap_prn");
+
+/// Stable snapshot-pruned event payload.
+///
+/// Event shape:
+/// - topics: `(SNAPSHOT_PRUNED_EVENT_NAME, creator_id)`
+/// - data: `SnapshotPrunedEvent`
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct SnapshotPrunedEvent {
+    pub creator_id: Address,
+    pub snapshot_id: u32,
+    pub ledger: u32,
+}
+
+/// Shared snapshot-pruned event topics tuple.
+pub fn snapshot_pruned_topics(creator_id: &Address) -> (Symbol, Address) {
+    (SNAPSHOT_PRUNED_EVENT_NAME, creator_id.clone())
+}
+
+// ============================================================================
+// Feature: batch_buy with per-key slippage — BatchBuyOrderResult event
+// ============================================================================
+
+/// Event name emitted per key in a batch buy when a per-order fee is collected.
+pub const BATCH_BUY_FEE_COLLECTED_EVENT_NAME: Symbol = symbol_short!("bb_fee");
+
+/// Stable batch-buy fee-collected event payload.
+///
+/// Event shape:
+/// - topics: `(BATCH_BUY_FEE_COLLECTED_EVENT_NAME, creator_id, buyer)`
+/// - data: `BatchBuyFeeCollectedEvent`
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct BatchBuyFeeCollectedEvent {
+    pub creator_id: Address,
+    pub buyer: Address,
+    pub quantity: u32,
+    pub total_price: i128,
+    pub fee_amount: i128,
+    pub ledger: u32,
+}
+
+/// Shared batch-buy fee-collected event topics tuple.
+pub fn batch_buy_fee_collected_topics(
+    creator_id: &Address,
+    buyer: &Address,
+) -> (Symbol, Address, Address) {
+    (
+        BATCH_BUY_FEE_COLLECTED_EVENT_NAME,
+        creator_id.clone(),
+        buyer.clone(),
+    )
+}

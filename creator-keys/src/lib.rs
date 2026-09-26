@@ -7,6 +7,7 @@ use soroban_sdk::{
 };
 
 pub mod events;
+pub mod test_feature_impl;
 pub mod test_new_features;
 
 // Contract error variants stability and ordering:
@@ -706,6 +707,16 @@ pub mod constants {
         pub const ORACLE_STALENESS_SECS: DataKey = DataKey::OracleStalenessSecs;
         pub const ACTION_NEXT_ID: DataKey = DataKey::ActionNextId;
         pub const TIMELOCK_DELAY_SECS: DataKey = DataKey::TimelockDelaySecs;
+        pub const GOVERNANCE_ADDRESS: DataKey = DataKey::GovernanceAddress;
+        pub const SNAPSHOT_RETENTION_LEDGERS: DataKey = DataKey::SnapshotRetentionLedgers;
+
+        pub fn next_snapshot_id(creator: &Address) -> DataKey {
+            DataKey::NextSnapshotId(creator.clone())
+        }
+
+        pub fn oldest_snapshot_id(creator: &Address) -> DataKey {
+            DataKey::OldestSnapshotId(creator.clone())
+        }
 
         pub fn action_proposal(action_id: u32) -> DataKey {
             DataKey::ActionProposal(action_id)
@@ -1308,6 +1319,15 @@ pub enum DataKey {
     ActionNextId,
     /// Configured timelock delay in seconds for new actions.
     TimelockDelaySecs,
+    /// Address of the authorised governance contract that may call `take_snapshot`.
+    GovernanceAddress,
+    /// Snapshot retention window in ledgers; snapshots older than this are pruned.
+    /// `0` means no age-based pruning (the default).
+    SnapshotRetentionLedgers,
+    /// (creator) -> next sequential snapshot id used to track the oldest snapshot for pruning.
+    NextSnapshotId(Address),
+    /// (creator) -> oldest snapshot id still present (used for pruning).
+    OldestSnapshotId(Address),
     /// (creator, holder) -> keys the holder has deposited in the staking vault.
     VaultShares(Address, Address),
     /// creator -> total keys deposited in the staking vault.
@@ -3416,6 +3436,137 @@ fn write_vault_position(
     extend_key_ttl_to_full_window(env, &staked_key);
 }
 
+/// Parameters accepted by `update_config` for validating and applying
+/// protocol configuration changes in a single call.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct ConfigUpdateParams {
+    /// New creator fee basis points (0..=10000). Must sum with `protocol_bps` to ≤ 10000.
+    pub creator_bps: u32,
+    /// New protocol fee basis points (0..=10000). Must sum with `creator_bps` to ≤ 10000.
+    pub protocol_bps: u32,
+    /// New bonding curve slope (≥ 0).
+    pub curve_slope: i128,
+}
+
+/// Reads the configured governance contract address, returning `None` when unset.
+pub fn read_governance_address(env: &Env) -> Option<Address> {
+    env.storage()
+        .persistent()
+        .get(&constants::storage::GOVERNANCE_ADDRESS)
+}
+
+/// Asserts that `caller` is the registered governance contract address.
+fn assert_is_governance(env: &Env, caller: &Address) -> Result<(), ContractError> {
+    let governance = read_governance_address(env).ok_or(ContractError::Unauthorized)?;
+    if *caller != governance {
+        return Err(ContractError::Unauthorized);
+    }
+    Ok(())
+}
+
+/// Emits a [`events::HolderCountChangedEvent`] whenever the holder count
+/// crosses the zero boundary.
+///
+/// `old_count` and `new_count` must already reflect the change; this helper
+/// is purely the emit call so the pattern is not duplicated across buy, sell,
+/// buyback, burn, transfer, and vesting paths.
+fn emit_holder_count_changed(env: &Env, creator: &Address, old_count: u32, new_count: u32) {
+    if old_count == new_count {
+        return;
+    }
+    env.events().publish(
+        events::holder_count_changed_topics(creator),
+        events::HolderCountChangedEvent {
+            creator_id: creator.clone(),
+            old_count,
+            new_count,
+            ledger: env.ledger().sequence(),
+        },
+    );
+}
+
+/// Reads the snapshot retention window in ledgers (`0` = no age-based pruning).
+fn read_snapshot_retention_ledgers(env: &Env) -> u32 {
+    env.storage()
+        .persistent()
+        .get(&constants::storage::SNAPSHOT_RETENTION_LEDGERS)
+        .unwrap_or(0)
+}
+
+/// Prunes snapshots for `creator` that are older than the configured retention
+/// window (based on `snapshot_ledger`). Works by walking forward from the
+/// `OldestSnapshotId` until it finds a snapshot that is still within the
+/// retention window (or exhausts known ids up to `current_snapshot_id`).
+///
+/// This is a best-effort prune: it stops on the first snapshot it cannot find
+/// (already pruned or never stored) to avoid runaway loops.
+fn prune_old_snapshots(env: &Env, creator: &Address, current_snapshot_id: u32) {
+    let retention = read_snapshot_retention_ledgers(env);
+    if retention == 0 {
+        return;
+    }
+    let current_ledger = env.ledger().sequence();
+    let cutoff = current_ledger.saturating_sub(retention);
+
+    let oldest_key = constants::storage::oldest_snapshot_id(creator);
+    let oldest_id: u32 = env.storage().persistent().get(&oldest_key).unwrap_or(0);
+
+    let mut cursor = oldest_id;
+    while cursor < current_snapshot_id {
+        let meta_key = constants::storage::snapshot_meta(creator, cursor);
+        let meta: Option<HolderSnapshotMeta> = env.storage().persistent().get(&meta_key);
+        let Some(meta) = meta else {
+            // Already pruned or never stored — advance.
+            cursor += 1;
+            continue;
+        };
+        if meta.snapshot_ledger >= cutoff {
+            // Still within retention window — stop pruning.
+            break;
+        }
+
+        // Prune: remove per-holder balance and staked-balance entries, then
+        // remove the holders list and meta key.
+        let holders_key = constants::storage::snapshot_holders(creator, cursor);
+        let holders: Option<soroban_sdk::Vec<Address>> =
+            env.storage().persistent().get(&holders_key);
+        if let Some(holders) = holders {
+            for holder in holders.iter() {
+                env.storage()
+                    .persistent()
+                    .remove(&constants::storage::snapshot_balance(
+                        creator, cursor, &holder,
+                    ));
+                env.storage()
+                    .persistent()
+                    .remove(&constants::storage::snapshot_staked_balance(
+                        creator, cursor, &holder,
+                    ));
+            }
+        }
+        env.storage().persistent().remove(&holders_key);
+        env.storage().persistent().remove(&meta_key);
+
+        env.events().publish(
+            events::snapshot_pruned_topics(creator),
+            events::SnapshotPrunedEvent {
+                creator_id: creator.clone(),
+                snapshot_id: cursor,
+                ledger: current_ledger,
+            },
+        );
+
+        cursor += 1;
+    }
+
+    // Advance the oldest pointer to avoid re-scanning pruned ids.
+    if cursor != oldest_id {
+        env.storage().persistent().set(&oldest_key, &cursor);
+        extend_key_ttl_to_full_window(env, &oldest_key);
+    }
+}
+
 /// Maximum bid-ask spread in basis points (50%).
 ///
 /// Caps the on-chain spread setting so the sell price is never forced below
@@ -3524,7 +3675,6 @@ fn accrue_trade_analytics(
 
     Ok(())
 }
-
 #[contract]
 pub struct CreatorKeysContract;
 
@@ -3931,6 +4081,16 @@ impl CreatorKeysContract {
             let key = constants::storage::creator(&creator);
             env.storage().persistent().set(&key, &profile);
 
+            // Emit HolderCountChanged when a new holder enters (first buy).
+            if current_balance == 0 {
+                emit_holder_count_changed(
+                    &env,
+                    &creator,
+                    profile.holder_count - 1,
+                    profile.holder_count,
+                );
+            }
+
             profile.supply = profile
                 .supply
                 .checked_add(1)
@@ -4326,6 +4486,16 @@ impl CreatorKeysContract {
         let key = constants::storage::creator(&creator);
         env.storage().persistent().set(&key, &profile);
 
+        // Emit HolderCountChanged when a new holder enters (first buy).
+        if current_balance == 0 {
+            emit_holder_count_changed(
+                &env,
+                &creator,
+                profile.holder_count - 1,
+                profile.holder_count,
+            );
+        }
+
         profile.supply = profile
             .supply
             .checked_add(1)
@@ -4646,6 +4816,16 @@ impl CreatorKeysContract {
         // Persist holder_count before write_creator_supply reads the profile.
         let key = constants::storage::creator(&creator);
         env.storage().persistent().set(&key, &profile);
+
+        // Emit HolderCountChanged when a holder fully exits (balance hits zero).
+        if new_balance == 0 {
+            emit_holder_count_changed(
+                &env,
+                &creator,
+                profile.holder_count + 1,
+                profile.holder_count,
+            );
+        }
 
         // Supply and holder balance are updated together to preserve
         // supply/holder_count invariants for subsequent reads.
@@ -6421,7 +6601,7 @@ impl CreatorKeysContract {
     }
 
     /// Updates a creator's key metadata. Only fields wrapped in `Some` are
-    /// changed; `None` fields remain untouched.
+    /// changed; `None` fields remain untouched. Emits `MetadataUpdated`.
     pub fn update_metadata(
         env: Env,
         creator: Address,
@@ -6434,10 +6614,15 @@ impl CreatorKeysContract {
             read_creator_metadata(&env, &creator).ok_or(ContractError::NotRegistered)?;
 
         let mut changed = false;
+        let mut updated_name = String::from_str(&env, "");
+        let mut updated_bio = String::from_str(&env, "");
+        let mut updated_avatar = String::from_str(&env, "");
+
         if let Some(n) = name {
             if n.len() > METADATA_NAME_MAX_LEN {
                 return Err(ContractError::HandleTooLong);
             }
+            updated_name = n.clone();
             metadata.name = n;
             changed = true;
         }
@@ -6445,6 +6630,7 @@ impl CreatorKeysContract {
             if b.len() > METADATA_BIO_MAX_LEN {
                 return Err(ContractError::HandleTooLong);
             }
+            updated_bio = b.clone();
             metadata.bio = b;
             changed = true;
         }
@@ -6452,6 +6638,7 @@ impl CreatorKeysContract {
             if u.len() > METADATA_AVATAR_URI_MAX_LEN {
                 return Err(ContractError::HandleTooLong);
             }
+            updated_avatar = u.clone();
             metadata.avatar_uri = u;
             changed = true;
         }
@@ -6461,7 +6648,496 @@ impl CreatorKeysContract {
         }
 
         write_creator_metadata(&env, &creator, &metadata);
+
+        env.events().publish(
+            events::metadata_updated_topics(&creator),
+            events::MetadataUpdatedEvent {
+                creator_id: creator.clone(),
+                name: updated_name,
+                bio: updated_bio,
+                avatar_uri: updated_avatar,
+                ledger: env.ledger().sequence(),
+            },
+        );
+
         Ok(())
+    }
+
+    // =========================================================================
+    // Feature: update_config — admin-only bonding curve / fee config update
+    // =========================================================================
+
+    /// Updates protocol configuration parameters in a single admin call.
+    ///
+    /// Validates all values before applying any change so the update is atomic.
+    /// Emits a [`events::ConfigUpdatedEvent`] on success.
+    ///
+    /// # Validation rules
+    ///
+    /// - `params.creator_bps + params.protocol_bps` must be `> 0` and `<= 10000`.
+    /// - `params.protocol_bps` must be `<= fee::PROTOCOL_BPS_MAX` (10000).
+    /// - `params.curve_slope` must be `>= 0`.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContractError::Unauthorized`] — caller is not the protocol admin.
+    /// - [`ContractError::InvalidFeeConfig`] — fee bps are out of range.
+    /// - [`ContractError::ProtocolFeeExceedsCap`] — `protocol_bps > PROTOCOL_BPS_MAX`.
+    /// - [`ContractError::NotPositiveAmount`] — `curve_slope < 0`.
+    pub fn update_config(
+        env: Env,
+        admin: Address,
+        params: ConfigUpdateParams,
+    ) -> Result<(), ContractError> {
+        admin.require_auth();
+        assert_is_admin(&env, &admin)?;
+
+        // Validate fee bps using the shared helper.
+        fee::assert_valid_fee_bps(params.creator_bps, params.protocol_bps)?;
+
+        if params.curve_slope < 0 {
+            return Err(ContractError::NotPositiveAmount);
+        }
+
+        // Apply: update fee config.
+        let new_fee_config = fee::FeeConfig {
+            creator_bps: params.creator_bps,
+            protocol_bps: params.protocol_bps,
+        };
+        env.storage()
+            .persistent()
+            .set(&constants::storage::FEE_CONFIG, &new_fee_config);
+        extend_key_ttl_to_full_window(&env, &constants::storage::FEE_CONFIG);
+
+        // Apply: update curve slope.
+        env.storage()
+            .persistent()
+            .set(&constants::storage::CURVE_SLOPE, &params.curve_slope);
+        extend_key_ttl_to_full_window(&env, &constants::storage::CURVE_SLOPE);
+
+        // Increment protocol state version on config update.
+        let current_version: u32 = env
+            .storage()
+            .persistent()
+            .get(&constants::storage::PROTOCOL_STATE_VERSION)
+            .unwrap_or(PROTOCOL_STATE_VERSION_INITIAL);
+        let new_version = current_version
+            .checked_add(1)
+            .ok_or(ContractError::Overflow)?;
+        env.storage()
+            .persistent()
+            .set(&constants::storage::PROTOCOL_STATE_VERSION, &new_version);
+
+        env.events().publish(
+            events::config_updated_topics(&admin),
+            events::ConfigUpdatedEvent {
+                admin: admin.clone(),
+                creator_bps: params.creator_bps,
+                protocol_bps: params.protocol_bps,
+                curve_slope: params.curve_slope,
+                ledger: env.ledger().sequence(),
+            },
+        );
+
+        Ok(())
+    }
+
+    // =========================================================================
+    // Feature: holder_count — get_holder_count() view alias
+    // =========================================================================
+
+    // =========================================================================
+    // Feature: snapshot governance auth + pruning
+    // =========================================================================
+
+    /// Sets the governance contract address that is authorised to call
+    /// [`Self::take_snapshot_governance`].
+    ///
+    /// Only callable by the protocol admin.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContractError::Unauthorized`] if `admin` is not the protocol admin.
+    pub fn set_governance_address(
+        env: Env,
+        admin: Address,
+        governance: Address,
+    ) -> Result<(), ContractError> {
+        admin.require_auth();
+        assert_is_admin(&env, &admin)?;
+
+        env.storage()
+            .persistent()
+            .set(&constants::storage::GOVERNANCE_ADDRESS, &governance);
+        extend_key_ttl_to_full_window(&env, &constants::storage::GOVERNANCE_ADDRESS);
+
+        env.events()
+            .publish(events::governance_address_set_topics(&admin), governance);
+
+        Ok(())
+    }
+
+    /// Read-only view: returns the configured governance contract address, if any.
+    pub fn get_governance_address(env: Env) -> Option<Address> {
+        read_governance_address(&env)
+    }
+
+    /// Sets the retention window (in ledgers) after which snapshots are pruned.
+    ///
+    /// A value of `0` disables age-based pruning. Only callable by the protocol
+    /// admin.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContractError::Unauthorized`] if `admin` is not the protocol admin.
+    pub fn set_snapshot_retention(
+        env: Env,
+        admin: Address,
+        retention_ledgers: u32,
+    ) -> Result<(), ContractError> {
+        admin.require_auth();
+        assert_is_admin(&env, &admin)?;
+
+        env.storage().persistent().set(
+            &constants::storage::SNAPSHOT_RETENTION_LEDGERS,
+            &retention_ledgers,
+        );
+        extend_key_ttl_to_full_window(&env, &constants::storage::SNAPSHOT_RETENTION_LEDGERS);
+        Ok(())
+    }
+
+    /// Read-only view: returns the configured snapshot retention window in ledgers.
+    pub fn get_snapshot_retention(env: Env) -> u32 {
+        read_snapshot_retention_ledgers(&env)
+    }
+
+    /// Records a snapshot of holder balances, callable **only** by the registered
+    /// governance contract (set via [`Self::set_governance_address`]).
+    ///
+    /// This is the governance-gated variant of the existing admin-only
+    /// [`Self::take_snapshot`].  It also triggers age-based pruning of old
+    /// snapshots for the same creator after storing the new one.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContractError::Unauthorized`] — caller is not the registered governance contract.
+    /// - [`ContractError::NotRegistered`] — `creator` has no profile.
+    /// - [`ContractError::SnapshotHolderLimitExceeded`] — `holders` exceeds `MAX_SNAPSHOT_HOLDERS`.
+    /// - [`ContractError::SnapshotAlreadyExists`] — `snapshot_id` already used for `creator`.
+    pub fn take_snapshot_governance(
+        env: Env,
+        caller: Address,
+        creator: Address,
+        snapshot_id: u32,
+        holders: soroban_sdk::Vec<Address>,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        assert_is_governance(&env, &caller)?;
+        read_registered_creator_profile(&env, &creator)?;
+
+        if holders.len() > MAX_SNAPSHOT_HOLDERS {
+            return Err(ContractError::SnapshotHolderLimitExceeded);
+        }
+
+        let meta_key = constants::storage::snapshot_meta(&creator, snapshot_id);
+        if env.storage().persistent().has(&meta_key) {
+            return Err(ContractError::SnapshotAlreadyExists);
+        }
+
+        let snapshot_ledger = env.ledger().sequence();
+        let mut total_holders: u32 = 0;
+
+        for holder in holders.iter() {
+            let balance_key = constants::storage::holder_balance_key(&creator, &holder);
+            let balance: u32 = env.storage().persistent().get(&balance_key).unwrap_or(0);
+            let staked_key = constants::storage::staked_balance(&creator, &holder);
+            let staked_balance: u32 = env.storage().persistent().get(&staked_key).unwrap_or(0);
+
+            let snap_key = constants::storage::snapshot_balance(&creator, snapshot_id, &holder);
+            env.storage().persistent().set(&snap_key, &balance);
+            extend_key_ttl_to_full_window(&env, &snap_key);
+
+            let snap_staked_key =
+                constants::storage::snapshot_staked_balance(&creator, snapshot_id, &holder);
+            env.storage()
+                .persistent()
+                .set(&snap_staked_key, &staked_balance);
+            extend_key_ttl_to_full_window(&env, &snap_staked_key);
+
+            total_holders = total_holders
+                .checked_add(1)
+                .ok_or(ContractError::Overflow)?;
+        }
+
+        let meta = HolderSnapshotMeta {
+            snapshot_ledger,
+            total_holders,
+        };
+        env.storage().persistent().set(&meta_key, &meta);
+        extend_key_ttl_to_full_window(&env, &meta_key);
+
+        let holders_key = constants::storage::snapshot_holders(&creator, snapshot_id);
+        env.storage().persistent().set(&holders_key, &holders);
+        extend_key_ttl_to_full_window(&env, &holders_key);
+
+        // Track oldest snapshot id for pruning.
+        let oldest_key = constants::storage::oldest_snapshot_id(&creator);
+        if !env.storage().persistent().has(&oldest_key) {
+            env.storage().persistent().set(&oldest_key, &snapshot_id);
+            extend_key_ttl_to_full_window(&env, &oldest_key);
+        }
+
+        // Prune snapshots that have aged out.
+        prune_old_snapshots(&env, &creator, snapshot_id);
+
+        env.events().publish(
+            events::snapshot_taken_topics(&creator, snapshot_id),
+            events::SnapshotTakenEvent {
+                creator_id: creator,
+                snapshot_id,
+                snapshot_ledger,
+                total_holders,
+            },
+        );
+
+        Ok(())
+    }
+
+    // =========================================================================
+    // Feature: enhanced batch_buy with per-key max_price slippage + FeeCollected
+    // =========================================================================
+
+    /// Executes multiple key purchases across different creators in a single
+    /// transaction, with per-key slippage protection and `FeeCollected` events.
+    ///
+    /// Each order is a `(creator_address, quantity, max_price_per_order)` tuple
+    /// where `max_price_per_order` is the caller's slippage ceiling for the
+    /// **total** cost of that order (`quantity` keys). Pass `None` to skip the
+    /// slippage check for a given order.
+    ///
+    /// The batch size is capped at [`MAX_BATCH_BUY_SIZE`] orders; exceeding it
+    /// returns [`ContractError::BatchClaimExceedsLimit`].
+    ///
+    /// All orders execute or none do (Soroban transaction atomicity). A
+    /// [`events::FeeCollectedEvent`] is emitted for every order that incurs a
+    /// protocol trade fee, and a summary [`events::BatchBuyCompletedEvent`] is
+    /// emitted at the end.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContractError::BatchClaimExceedsLimit`] — batch is empty or too large.
+    /// - [`ContractError::NotPositiveAmount`] — an order has `quantity == 0`.
+    /// - [`ContractError::SlippageExceeded`] — total order cost > `max_price`.
+    /// - Any error that `buy_key` would return for an individual order.
+    pub fn batch_buy_v2(
+        env: Env,
+        buyer: Address,
+        orders: soroban_sdk::Vec<(Address, u32, Option<i128>)>,
+    ) -> Result<soroban_sdk::Vec<BatchBuyOrderResult>, ContractError> {
+        buyer.require_auth();
+        assert_not_paused(&env)?;
+        assert_not_blacklisted(&env, &buyer)?;
+        assert_before_global_deadline(&env)?;
+        assert_global_trading_not_halted(&env)?;
+
+        if orders.is_empty() || orders.len() > MAX_BATCH_BUY_SIZE as u32 {
+            return Err(ContractError::BatchClaimExceedsLimit);
+        }
+
+        let base_price: i128 = env
+            .storage()
+            .persistent()
+            .get(&constants::storage::KEY_PRICE)
+            .ok_or(ContractError::KeyPriceNotSet)?;
+        bump_persistent_ttl(&env, &constants::storage::KEY_PRICE);
+
+        let mut results = soroban_sdk::Vec::new(&env);
+        let mut total_price_paid: i128 = 0;
+
+        for order in orders.iter() {
+            let (creator, quantity, max_price) = order;
+
+            if quantity == 0 {
+                return Err(ContractError::NotPositiveAmount);
+            }
+
+            // Reject deprecated keys.
+            if env
+                .storage()
+                .persistent()
+                .has(&constants::storage::deprecated_key(&creator))
+            {
+                return Err(ContractError::KeyDeprecated);
+            }
+
+            assert_position_not_frozen(&env, &buyer, &creator)?;
+            let mut profile: CreatorProfile = read_registered_creator_profile(&env, &creator)?;
+            assert_whitelist_allows_buy(&env, &profile, &buyer)?;
+
+            let mut order_price: i128 = 0;
+
+            let mut i = 0u32;
+            while i < quantity {
+                let price =
+                    compute_bonding_curve_price(&env, &creator, base_price, profile.supply)?;
+
+                let balance_key = constants::storage::holder_balance_key(&creator, &buyer);
+                let current_balance: u32 =
+                    env.storage().persistent().get(&balance_key).unwrap_or(0);
+
+                // Settle dividends before balance changes.
+                settle_holder_dividends(&env, &creator, &buyer, current_balance)?;
+
+                let old_holder_count = profile.holder_count;
+                if current_balance == 0 {
+                    profile.holder_count = profile
+                        .holder_count
+                        .checked_add(1)
+                        .ok_or(ContractError::Overflow)?;
+                }
+
+                let creator_profile_key = constants::storage::creator(&creator);
+                env.storage()
+                    .persistent()
+                    .set(&creator_profile_key, &profile);
+
+                // Emit HolderCountChanged on first buy.
+                if current_balance == 0 {
+                    emit_holder_count_changed(
+                        &env,
+                        &creator,
+                        old_holder_count,
+                        profile.holder_count,
+                    );
+                }
+
+                profile.supply = profile
+                    .supply
+                    .checked_add(1)
+                    .ok_or(ContractError::Overflow)?;
+
+                write_creator_supply(&env, &creator, profile.supply);
+
+                let new_balance = current_balance
+                    .checked_add(1)
+                    .ok_or(ContractError::Overflow)?;
+                env.storage().persistent().set(&balance_key, &new_balance);
+                extend_key_ttl_to_full_window(&env, &balance_key);
+
+                // Collect protocol trade fee and emit FeeCollected per key.
+                let trade_fee = compute_trade_fee(&env, price)?;
+                if trade_fee > 0 {
+                    if let Some((_, treasury)) = read_trade_fee_config(&env) {
+                        credit_treasury_balance(&env, trade_fee)?;
+                        credit_staking_rewards_pool(&env, &creator, trade_fee)?;
+                        env.events().publish(
+                            events::fee_collected_topics(&treasury),
+                            events::FeeCollectedEvent {
+                                treasury: treasury.clone(),
+                                amount: trade_fee,
+                                ledger: env.ledger().sequence(),
+                            },
+                        );
+                    }
+                }
+
+                // Collect creator / protocol fee split.
+                let net_amount = price
+                    .checked_sub(trade_fee)
+                    .ok_or(ContractError::Overflow)?;
+                if let Some(config) = read_protocol_fee_config(&env) {
+                    let (creator_fee, protocol_fee) = fee::checked_compute_fee_split(
+                        net_amount,
+                        config.creator_bps,
+                        config.protocol_bps,
+                    )
+                    .ok_or(ContractError::Overflow)?;
+                    credit_creator_fee(&env, &creator, creator_fee)?;
+                    credit_treasury_balance(&env, protocol_fee)?;
+                    credit_protocol_fee_recipient_balance(&env, protocol_fee)?;
+                }
+
+                if let Some(royalty) = read_royalty_config(&env, &creator) {
+                    let royalty_amount = fee::apply_percentage_fee(price, royalty.buy_fee_bps)
+                        .ok_or(ContractError::Overflow)?;
+                    if royalty_amount > 0 {
+                        credit_creator_fee_recipient_balance(&env, &creator, royalty_amount)?;
+                    }
+                }
+
+                order_price = order_price
+                    .checked_add(price)
+                    .ok_or(ContractError::Overflow)?;
+
+                i += 1;
+            }
+
+            // Per-order slippage check: total cost for this order vs max_price.
+            if let Some(max) = max_price {
+                if order_price > max {
+                    return Err(ContractError::SlippageExceeded);
+                }
+                env.events().publish(
+                    events::slippage_check_passed_topics(&creator),
+                    events::SlippageCheckPassedEvent {
+                        creator_id: creator.clone(),
+                        actual_amount: order_price,
+                        bound: max,
+                        ledger: env.ledger().sequence(),
+                    },
+                );
+            }
+
+            // Emit BatchBuyFeeCollected summary per order.
+            let order_trade_fee = compute_trade_fee(&env, order_price).unwrap_or(0);
+            env.events().publish(
+                events::batch_buy_fee_collected_topics(&creator, &buyer),
+                events::BatchBuyFeeCollectedEvent {
+                    creator_id: creator.clone(),
+                    buyer: buyer.clone(),
+                    quantity,
+                    total_price: order_price,
+                    fee_amount: order_trade_fee,
+                    ledger: env.ledger().sequence(),
+                },
+            );
+
+            env.events().publish(
+                events::buy_event_topics(&creator, &buyer),
+                events::KeysBoughtEvent {
+                    buyer: buyer.clone(),
+                    creator_id: creator.clone(),
+                    quantity,
+                    price_paid: order_price,
+                    new_supply: profile.supply,
+                    ledger: env.ledger().sequence(),
+                },
+            );
+
+            total_price_paid = total_price_paid
+                .checked_add(order_price)
+                .ok_or(ContractError::Overflow)?;
+
+            extend_creator_ttl(&env, &creator);
+
+            results.push_back(BatchBuyOrderResult {
+                creator,
+                quantity,
+                price_paid: order_price,
+            });
+        }
+
+        env.events().publish(
+            events::batch_buy_completed_topics(&buyer),
+            events::BatchBuyCompletedEvent {
+                buyer: buyer.clone(),
+                total_price_paid,
+                order_count: results.len(),
+                ledger: env.ledger().sequence(),
+            },
+        );
+
+        Ok(results)
     }
 
     /// Read-only view: returns accrued co-creator fee balance for a creator.

@@ -1861,11 +1861,10 @@ fn test_buy_event_topic_and_data_order_is_stable() {
     client.buy_key(&creator, &buyer, &500, &None);
 
     let all_events = env.events().all();
-    // Each client call is a separate invocation; env.events().all() returns events
-    // from the most recent call only. After buy_key, exactly one buy event is present.
-    assert_eq!(all_events.len(), 1, "expected exactly one buy event");
+    // buy_key may emit a HolderCountChangedEvent (new holder) before the buy event;
+    // the buy event is always last.
+    assert!(!all_events.is_empty(), "expected at least one buy event");
 
-    // The buy event is the only one emitted in this invocation.
     let (_contract_id, topics, data): (
         Address,
         soroban_sdk::Vec<soroban_sdk::Val>,
@@ -2897,13 +2896,13 @@ fn test_buy_and_sell_events_contain_matching_creator_id() {
     client.buy_key(&creator, &buyer, &100, &None);
 
     let all_events = env.events().all();
-    assert_eq!(all_events.len(), 1, "expected exactly one buy event");
+    assert!(!all_events.is_empty(), "expected at least one buy event");
 
     let (_contract_id, _topics, data): (
         Address,
         soroban_sdk::Vec<soroban_sdk::Val>,
         soroban_sdk::Val,
-    ) = all_events.get(0).unwrap();
+    ) = all_events.get(all_events.len() - 1).unwrap();
 
     let buy_event: events::KeysBoughtEvent = data.try_into_val(&env).unwrap();
     assert_eq!(
@@ -2918,13 +2917,13 @@ fn test_buy_and_sell_events_contain_matching_creator_id() {
     client.sell_key(&creator, &buyer, &None);
 
     let all_events = env.events().all();
-    assert_eq!(all_events.len(), 1, "expected exactly one sell event");
+    assert!(!all_events.is_empty(), "expected at least one sell event");
 
     let (_contract_id, _topics, data): (
         Address,
         soroban_sdk::Vec<soroban_sdk::Val>,
         soroban_sdk::Val,
-    ) = all_events.get(0).unwrap();
+    ) = all_events.get(all_events.len() - 1).unwrap();
 
     let sell_event: events::KeysSoldEvent = data.try_into_val(&env).unwrap();
     assert_eq!(
