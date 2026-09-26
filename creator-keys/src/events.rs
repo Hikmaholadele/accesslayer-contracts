@@ -39,8 +39,8 @@
 //! - `payment`: Total amount paid by the buyer (for buy events, ≥ key price)
 
 use crate::{
-    constants, read_creator_supply, read_registered_creator_profile, CreatorKeysContract,
-    CreatorKeysContractArgs, CreatorKeysContractClient,
+    constants, extend_key_ttl_to_full_window, read_creator_supply, read_registered_creator_profile,
+    CreatorKeysContract, CreatorKeysContractArgs, CreatorKeysContractClient,
 };
 use soroban_sdk::{
     contracterror, contractimpl, contracttype, symbol_short, Address, Env, String, Symbol, Vec,
@@ -1167,7 +1167,14 @@ pub struct PollClosedEvent {
     pub creator_id: Address,
     pub poll_id: u32,
     pub total_weight: u32,
+    /// Whether participation actually met the creator's `quorum_bps`.
+    ///
+    /// This stays `false` for a close that was only permitted because quorum
+    /// escalation had no extensions left, so off-chain consumers can tell a
+    /// genuine quorum from a deadline finalization.
     pub quorum_reached: bool,
+    /// Whether this close was permitted purely by an exhausted extension budget.
+    pub finalized_by_exhaustion: bool,
     pub ledger: u32,
 }
 
@@ -1201,6 +1208,8 @@ pub enum PollDataKey {
     NextPollId(Address),
     Poll(Address, u32),
     Vote(Address, u32, Address),
+    /// (creator, poll_id) -> number of quorum-escalation extensions consumed.
+    ExtensionCount(Address, u32),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1240,11 +1249,62 @@ pub fn vote_storage_key(creator_id: &Address, poll_id: u32, voter: &Address) -> 
     PollDataKey::Vote(creator_id.clone(), poll_id, voter.clone())
 }
 
+/// Storage key for a poll's consumed quorum-escalation extension count.
+pub fn poll_extension_count_key(creator_id: &Address, poll_id: u32) -> PollDataKey {
+    PollDataKey::ExtensionCount(creator_id.clone(), poll_id)
+}
+
+/// Reads the number of quorum-escalation extensions a poll has consumed.
+///
+/// A poll that has never been evaluated returns `0`.
+pub fn read_poll_extension_count(env: &Env, creator_id: &Address, poll_id: u32) -> u32 {
+    env.storage()
+        .persistent()
+        .get(&poll_extension_count_key(creator_id, poll_id))
+        .unwrap_or(0)
+}
+
+/// Persists a poll's consumed quorum-escalation extension count.
+pub fn write_poll_extension_count(env: &Env, creator_id: &Address, poll_id: u32, count: u32) {
+    let key = poll_extension_count_key(creator_id, poll_id);
+    env.storage().persistent().set(&key, &count);
+    extend_key_ttl_to_full_window(env, &key);
+}
+
+/// Returns `true` when a poll has consumed every extension the active
+/// escalation config allows.
+///
+/// A `false` here means the proposal can still be extended, so closing it below
+/// quorum would cut off a vote that quorum escalation is meant to rescue.
+/// Conversely a `true` here makes the proposal final: it closes on its own
+/// deadline even if participation never reached quorum.
+///
+/// When escalation is disabled — no config, or a `max_extensions` of `0` — this
+/// returns `false`, which keeps [`close_poll`]'s quorum requirement exactly as it
+/// behaved before escalation existed. Reporting "exhausted" there would instead
+/// let a creator with a configured `quorum_bps` close any failing proposal.
+pub fn poll_extensions_exhausted(env: &Env, creator_id: &Address, poll_id: u32) -> bool {
+    let max_extensions = crate::CreatorKeysContract::get_escalation_config(env.clone())
+        .map(|c| c.max_extensions)
+        .unwrap_or(0);
+    if max_extensions == 0 {
+        return false;
+    }
+    read_poll_extension_count(env, creator_id, poll_id) >= max_extensions
+}
+
 pub fn read_poll(env: &Env, creator_id: &Address, poll_id: u32) -> Result<Poll, PollError> {
     env.storage()
         .persistent()
         .get(&poll_storage_key(creator_id, poll_id))
         .ok_or(PollError::PollNotFound)
+}
+
+/// Persists a poll record and refreshes its TTL.
+pub fn write_poll(env: &Env, creator_id: &Address, poll_id: u32, poll: &Poll) {
+    let key = poll_storage_key(creator_id, poll_id);
+    env.storage().persistent().set(&key, poll);
+    extend_key_ttl_to_full_window(env, &key);
 }
 
 pub fn is_poll_expired(env: &Env, poll: &Poll) -> bool {
@@ -1403,9 +1463,14 @@ impl CreatorKeysContract {
             },
         );
         env.events().publish(
-            (POLL_VOTE_EVENT_NAME, creator_id, poll_id, voter),
+            (POLL_VOTE_EVENT_NAME, creator_id.clone(), poll_id, voter),
             (option_index, weight),
         );
+
+        // Voting is a positive reputation signal for the creator whose key
+        // holders are exercising governance rights.
+        crate::accrue_reputation_on_governance_participation(&env, &creator_id)
+            .map_err(|_| PollError::Overflow)?;
 
         Ok(())
     }
@@ -1432,7 +1497,13 @@ impl CreatorKeysContract {
     ///
     /// Computes participation as `total_voting_weight / circulating_supply` (in basis points)
     /// against the creator's configured `quorum_bps`. If participation is below the quorum
-    /// threshold, returns `Err(PollError::QuorumNotReached)`.
+    /// threshold, the poll closes only once quorum escalation has no extensions left to give —
+    /// see [`poll_extensions_exhausted`]. Otherwise returns
+    /// `Err(PollError::QuorumNotReached)`.
+    ///
+    /// [`PollClosedEvent::quorum_reached`] always reports the real participation
+    /// outcome; a close that was only permitted because the extension budget ran
+    /// out is reported by [`PollClosedEvent::finalized_by_exhaustion`] instead.
     pub fn close_poll(
         env: Env,
         creator_id: Address,
@@ -1448,26 +1519,41 @@ impl CreatorKeysContract {
         let quorum_key = constants::storage::quorum_bps(&creator_id);
         let quorum_bps: u32 = env.storage().persistent().get(&quorum_key).unwrap_or(0);
 
+        // A creator with no configured quorum has no participation requirement,
+        // so the poll is always closable and has genuinely "reached" quorum.
+        let mut quorum_reached = true;
+        let mut finalized_by_exhaustion = false;
         if quorum_bps > 0 {
-            if circulating_supply == 0 {
-                return Err(PollError::QuorumNotReached);
-            }
-            let total_weight_bps = (poll.total_weight as u128)
-                .checked_mul(10_000)
-                .ok_or(PollError::Overflow)?;
-            let required_bps = (circulating_supply as u128)
-                .checked_mul(quorum_bps as u128)
-                .ok_or(PollError::Overflow)?;
+            // With no circulating supply, participation is undefined. A poll whose
+            // extensions are spent still has to close; one with budget left does not.
+            let participation_bps = if circulating_supply == 0 {
+                0
+            } else {
+                let total_weight_bps = (poll.total_weight as u128)
+                    .checked_mul(10_000)
+                    .ok_or(PollError::Overflow)?;
+                let required_bps = (circulating_supply as u128)
+                    .checked_mul(quorum_bps as u128)
+                    .ok_or(PollError::Overflow)?;
 
-            if total_weight_bps < required_bps {
-                return Err(PollError::QuorumNotReached);
+                if total_weight_bps >= required_bps {
+                    10_000
+                } else {
+                    ((total_weight_bps * 10_000) / required_bps) as u32
+                }
+            };
+
+            quorum_reached = participation_bps >= 10_000;
+            if !quorum_reached {
+                finalized_by_exhaustion = poll_extensions_exhausted(&env, &creator_id, poll_id);
+                if !finalized_by_exhaustion {
+                    return Err(PollError::QuorumNotReached);
+                }
             }
         }
 
         poll.closed = true;
-        env.storage()
-            .persistent()
-            .set(&poll_storage_key(&creator_id, poll_id), &poll);
+        write_poll(&env, &creator_id, poll_id, &poll);
 
         env.events().publish(
             poll_closed_topics(&creator_id, poll_id),
@@ -1475,7 +1561,8 @@ impl CreatorKeysContract {
                 creator_id: creator_id.clone(),
                 poll_id,
                 total_weight: poll.total_weight,
-                quorum_reached: true,
+                quorum_reached,
+                finalized_by_exhaustion,
                 ledger: env.ledger().sequence(),
             },
         );
@@ -2599,4 +2686,247 @@ pub fn batch_buy_fee_collected_topics(
         creator_id.clone(),
         buyer.clone(),
     )
+}
+
+// ============================================================================
+// Feature: creator reputation scoring
+// ============================================================================
+
+/// Event name emitted on every reputation score change.
+pub const REPUTATION_UPDATED_EVENT_NAME: Symbol = symbol_short!("rep_upd");
+
+/// Stable reputation-updated event payload.
+///
+/// Event shape:
+/// - topics: `(REPUTATION_UPDATED_EVENT_NAME, creator)`
+/// - data: `ReputationUpdatedEvent`
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct ReputationUpdatedEvent {
+    /// Creator whose reputation changed.
+    pub creator: Address,
+    /// Reputation score before the change.
+    pub old_score: i128,
+    /// Reputation score after the change.
+    pub new_score: i128,
+    /// Signed points applied by this change.
+    pub delta: i128,
+    /// Which on-chain action produced the change.
+    pub reason: crate::ReputationReason,
+    /// Ledger in which the change was recorded.
+    pub ledger: u32,
+}
+
+/// Shared reputation-updated event topics tuple.
+pub fn reputation_updated_topics(creator: &Address) -> (Symbol, Address) {
+    (REPUTATION_UPDATED_EVENT_NAME, creator.clone())
+}
+
+// ============================================================================
+// Feature: key transfer allowances (approve / transfer_from)
+// ============================================================================
+
+/// Event name emitted when a holder sets or changes a transfer allowance.
+pub const APPROVAL_EVENT_NAME: Symbol = symbol_short!("approval");
+
+/// Stable approval event payload.
+///
+/// Event shape:
+/// - topics: `(APPROVAL_EVENT_NAME, owner, spender)`
+/// - data: `ApprovalEvent`
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct ApprovalEvent {
+    /// Holder that granted the allowance.
+    pub owner: Address,
+    /// Address authorised to spend the allowance.
+    pub spender: Address,
+    /// Remaining allowance in whole keys after this call.
+    pub amount: u32,
+    /// Creator whose keys the allowance covers.
+    pub key_id: Address,
+    /// Ledger in which the approval was recorded.
+    pub ledger: u32,
+}
+
+/// Shared approval event topics tuple.
+pub fn approval_topics(owner: &Address, spender: &Address) -> (Symbol, Address, Address) {
+    (APPROVAL_EVENT_NAME, owner.clone(), spender.clone())
+}
+
+/// Event name emitted when a spender consumes an allowance via `transfer_from`.
+pub const TRANSFER_FROM_EVENT_NAME: Symbol = symbol_short!("xfer_from");
+
+/// Stable transfer-from event payload.
+///
+/// Event shape:
+/// - topics: `(TRANSFER_FROM_EVENT_NAME, key_id, spender)`
+/// - data: `TransferFromEvent`
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct TransferFromEvent {
+    /// Creator whose keys moved.
+    pub key_id: Address,
+    /// Address that consumed the allowance.
+    pub spender: Address,
+    /// Holder whose balance decreased.
+    pub from: Address,
+    /// Holder whose balance increased.
+    pub to: Address,
+    /// Number of keys transferred.
+    pub amount: u32,
+    /// Allowance remaining after the transfer.
+    pub remaining_allowance: u32,
+    /// Ledger in which the transfer executed.
+    pub ledger: u32,
+}
+
+/// Shared transfer-from event topics tuple.
+pub fn transfer_from_topics(key_id: &Address, spender: &Address) -> (Symbol, Address, Address) {
+    (TRANSFER_FROM_EVENT_NAME, key_id.clone(), spender.clone())
+}
+
+// ============================================================================
+// Feature: sell tax routed to the buyback pool
+// ============================================================================
+
+/// Event name emitted when a creator updates their per-key sell tax.
+pub const SELL_TAX_UPDATED_EVENT_NAME: Symbol = symbol_short!("tax_upd");
+
+/// Stable sell-tax-updated event payload.
+///
+/// Event shape:
+/// - topics: `(SELL_TAX_UPDATED_EVENT_NAME, creator)`
+/// - data: `SellTaxUpdatedEvent`
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct SellTaxUpdatedEvent {
+    /// Creator whose sell tax changed.
+    pub creator: Address,
+    /// Previous sell tax in basis points.
+    pub old_tax_bps: u32,
+    /// New sell tax in basis points.
+    pub new_tax_bps: u32,
+    /// Ledger in which the change was recorded.
+    pub ledger: u32,
+}
+
+/// Shared sell-tax-updated event topics tuple.
+pub fn sell_tax_updated_topics(creator: &Address) -> (Symbol, Address) {
+    (SELL_TAX_UPDATED_EVENT_NAME, creator.clone())
+}
+
+/// Event name emitted on every sell that collects a non-zero tax.
+pub const SELL_TAX_COLLECTED_EVENT_NAME: Symbol = symbol_short!("tax_col");
+
+/// Stable sell-tax-collected event payload.
+///
+/// Event shape:
+/// - topics: `(SELL_TAX_COLLECTED_EVENT_NAME, creator, seller)`
+/// - data: `SellTaxCollectedEvent`
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct SellTaxCollectedEvent {
+    /// Creator whose key was sold.
+    pub creator: Address,
+    /// Seller that paid the tax.
+    pub seller: Address,
+    /// Tax amount in XLM stroops, already forwarded to `pool`.
+    pub amount: i128,
+    /// Address credited with the tax.
+    pub pool: Address,
+    /// Tax rate applied in basis points.
+    pub tax_bps: u32,
+    /// Gross sell proceeds the tax was deducted from.
+    pub gross_proceeds: i128,
+    /// Proceeds actually delivered to the seller after the tax.
+    pub net_proceeds: i128,
+    /// Buyback pool balance after the tax was added.
+    pub pool_balance: i128,
+    /// Ledger in which the tax was collected.
+    pub ledger: u32,
+}
+
+/// Shared sell-tax-collected event topics tuple.
+pub fn sell_tax_collected_topics(
+    creator: &Address,
+    seller: &Address,
+) -> (Symbol, Address, Address) {
+    (
+        SELL_TAX_COLLECTED_EVENT_NAME,
+        creator.clone(),
+        seller.clone(),
+    )
+}
+
+// ============================================================================
+// Feature: governance quorum escalation
+// ============================================================================
+
+/// Event name emitted each time a proposal's voting deadline is extended.
+pub const PROPOSAL_EXTENDED_EVENT_NAME: Symbol = symbol_short!("prop_ext");
+
+/// Stable proposal-extended event payload.
+///
+/// Event shape:
+/// - topics: `(PROPOSAL_EXTENDED_EVENT_NAME, creator_id, poll_id)`
+/// - data: `ProposalExtendedEvent`
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct ProposalExtendedEvent {
+    /// Creator that owns the proposal.
+    pub creator_id: Address,
+    /// Proposal id, scoped to the creator.
+    pub poll_id: u32,
+    /// Deadline before the extension.
+    pub old_expires_at: u32,
+    /// Deadline after the extension.
+    pub new_expires_at: u32,
+    /// Extensions consumed after this call.
+    pub extensions_used: u32,
+    /// Maximum extensions allowed by the active config.
+    pub max_extensions: u32,
+    /// Ledger in which the extension was applied.
+    pub ledger: u32,
+}
+
+/// Shared proposal-extended event topics tuple.
+pub fn proposal_extended_topics(creator_id: &Address, poll_id: u32) -> (Symbol, Address, u32) {
+    (PROPOSAL_EXTENDED_EVENT_NAME, creator_id.clone(), poll_id)
+}
+
+/// Event name emitted when the protocol admin changes the escalation config.
+pub const ESCALATION_CONFIG_UPDATED_EVENT_NAME: Symbol = symbol_short!("esc_cfg");
+
+/// Stable escalation-config-updated event payload.
+///
+/// Event shape:
+/// - topics: `(ESCALATION_CONFIG_UPDATED_EVENT_NAME, admin)`
+/// - data: `EscalationConfigUpdatedEvent`
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct EscalationConfigUpdatedEvent {
+    /// Admin that applied the change.
+    pub admin: Address,
+    /// `true` when a config was already active before this call.
+    pub had_previous_config: bool,
+    /// Previously active threshold in basis points.
+    pub old_threshold_bps: u32,
+    /// Previously active extension duration in ledgers.
+    pub old_extension_ledgers: u32,
+    /// Previously active extension cap.
+    pub old_max_extensions: u32,
+    /// Newly active threshold in basis points.
+    pub new_threshold_bps: u32,
+    /// Newly active extension duration in ledgers.
+    pub new_extension_ledgers: u32,
+    /// Newly active extension cap.
+    pub new_max_extensions: u32,
+    /// Ledger in which the change was recorded.
+    pub ledger: u32,
+}
+
+/// Shared escalation-config-updated event topics tuple.
+pub fn escalation_config_updated_topics(admin: &Address) -> (Symbol, Address) {
+    (ESCALATION_CONFIG_UPDATED_EVENT_NAME, admin.clone())
 }
